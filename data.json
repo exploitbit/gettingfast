@@ -1,6 +1,16 @@
 {
-  "tasks": [],
+  "tasks": [
+    {
+      "id": 1,
+      "text": "Ndndjd",
+      "timestamp": "2026-02-09 00:09:41",
+      "date": "February 09, 2026",
+      "time": "12:09 AM",
+      "type": "task",
+      "source": "telegram"
+    }
+  ],
   "messages": [],
   "notes": [],
-  "last_id": 0
+  "last_id": 1
 }

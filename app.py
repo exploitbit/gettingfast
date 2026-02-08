@@ -1,6 +1,7 @@
 
 """
 Simple Task Tracker with GitHub Storage
+Koyeb-compatible version
 """
 
 import os
@@ -8,7 +9,7 @@ import json
 import threading
 from datetime import datetime
 import pytz
-from flask import Flask, request, render_template_string, send_file, jsonify
+from flask import Flask, request, render_template_string, jsonify
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import requests
@@ -18,7 +19,7 @@ import base64
 BOT_TOKEN = "8388773187:AAFxz5U8GJ94Wf21VaGvFx9QQSZFU2Rd43I"
 USER_ID = "8469993808"
 
-# GitHub Configuration - UPDATED WITH YOUR INFO
+# GitHub Configuration
 GITHUB_TOKEN = "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"
 GITHUB_REPO = "Qepheyr/gettingfast"
 GITHUB_FILE_PATH = "data.json"
@@ -925,10 +926,16 @@ def start_bot():
         bot.polling(none_stop=True, interval=1, timeout=30)
     except Exception as e:
         print(f"❌ Bot error: {e}")
-        import time
-        time.sleep(5)
-        start_bot()
 
+# ============= KOYEB COMPATIBLE ENTRY POINT =============
+def create_app():
+    """Create Flask app for Koyeb"""
+    # Start bot in background thread
+    bot_thread = threading.Thread(target=start_bot, daemon=True)
+    bot_thread.start()
+    return app
+
+# For local development
 if __name__ == '__main__':
     # Create initial local backup if it doesn't exist
     if not os.path.exists(LOCAL_DATA_FILE):
@@ -949,6 +956,6 @@ if __name__ == '__main__':
     bot_thread.start()
     
     # Start Flask app
-    print("🚀 Starting web server on port 5000...")
-    print("👉 Web interface: http://localhost:5000")
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    print("🚀 Starting web server on port 8080...")
+    print("👉 Web interface: http://localhost:8080")
+    app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)

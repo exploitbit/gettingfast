@@ -1,31 +1,37 @@
+
 """
-Simplified Task Tracker with Telegram Bot - IST Timezone
+Task Tracker with Telegram Bot - IST Timezone
+Enhanced UI with SQLite Database
 """
 
 import os
 import sqlite3
 import threading
+import json
 from datetime import datetime, timedelta
 import pytz
-from flask import Flask, request, Response, render_template_string
+from flask import Flask, request, Response, render_template_string, jsonify, session, redirect, url_for
 import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 import time
+import secrets
 
 # ============= CONFIGURATION =============
 BOT_TOKEN = "8388773187:AAFxz5U8GJ94Wf21VaGvFx9QQSZFU2Rd43I"
 USER_ID = "8469993808"
-ADMIN_CODE = "1234"
+SECRET_KEY = secrets.token_hex(32)
 
 # Timezone setup
 IST = pytz.timezone('Asia/Kolkata')
 
 # Initialize Flask and Telegram bot
 app = Flask(__name__)
+app.secret_key = SECRET_KEY
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # ============= DATABASE SETUP =============
 def init_db():
-    """Initialize SQLite database"""
+    """Initialize SQLite database with all required tables"""
     conn = sqlite3.connect('tasks.db')
     c = conn.cursor()
     
@@ -34,12 +40,33 @@ def init_db():
         CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
+            description TEXT DEFAULT '',
             start_time DATETIME NOT NULL,
             end_time DATETIME NOT NULL,
             completed INTEGER DEFAULT 0,
             notify_enabled INTEGER DEFAULT 1,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            last_notified_minute INTEGER DEFAULT -1
+            last_notified_minute INTEGER DEFAULT -1,
+            priority INTEGER DEFAULT 15,
+            repeat TEXT DEFAULT 'none',
+            repeat_day TEXT DEFAULT NULL,
+            repeat_end_date DATETIME DEFAULT NULL,
+            next_occurrence DATETIME DEFAULT NULL,
+            bucket TEXT DEFAULT 'today'
+        )
+    ''')
+    
+    # Subtasks table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS subtasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            completed INTEGER DEFAULT 0,
+            priority INTEGER DEFAULT 15,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (task_id) REFERENCES tasks (id) ON DELETE CASCADE
         )
     ''')
     
@@ -49,8 +76,41 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             task_id INTEGER,
             title TEXT,
+            description TEXT,
+            type TEXT DEFAULT 'task',
+            bucket TEXT DEFAULT 'today',
+            repeat TEXT DEFAULT 'none',
             completed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            time_range TEXT,
+            priority INTEGER DEFAULT 15,
             FOREIGN KEY (task_id) REFERENCES tasks (id)
+        )
+    ''')
+    
+    # History subtasks table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS history_subtasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            history_id INTEGER,
+            title TEXT,
+            description TEXT,
+            priority INTEGER DEFAULT 15,
+            FOREIGN KEY (history_id) REFERENCES history (id) ON DELETE CASCADE
+        )
+    ''')
+    
+    # Notes table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            priority INTEGER DEFAULT 1,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            notify_enabled INTEGER DEFAULT 0,
+            notify_interval INTEGER DEFAULT 0,
+            last_notified DATETIME DEFAULT NULL
         )
     ''')
     
@@ -63,8 +123,17 @@ def init_db():
     ''')
     
     # Insert default settings
-    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('access_code', ?)", (ADMIN_CODE,))
-    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('daily_summary', '1')")
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('hourly_report', '1')")
+    
+    # Notification log table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS notification_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message TEXT,
+            success INTEGER DEFAULT 1,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
     
     conn.commit()
     conn.close()
@@ -78,7 +147,7 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
-def db_query(query, params=(), fetch_one=False):
+def db_query(query, params=(), fetch_one=False, fetch_all=False):
     """Execute database query"""
     conn = get_db()
     cursor = conn.cursor()
@@ -87,6 +156,8 @@ def db_query(query, params=(), fetch_one=False):
     if query.strip().upper().startswith('SELECT'):
         if fetch_one:
             result = cursor.fetchone()
+        elif fetch_all:
+            result = cursor.fetchall()
         else:
             result = cursor.fetchall()
     else:
@@ -96,7 +167,6 @@ def db_query(query, params=(), fetch_one=False):
     conn.close()
     return result
 
-# Helper to convert Row to dict
 def row_to_dict(row):
     """Convert sqlite3.Row to dictionary"""
     if row is None:
@@ -124,15 +194,24 @@ def parse_ist_time(time_str, date_str=None):
     return IST.localize(naive_dt)
 
 # ============= TELEGRAM FUNCTIONS =============
-def send_telegram_message(text):
+def send_telegram_message(text, chat_id=USER_ID):
     """Send message to Telegram"""
     try:
-        bot.send_message(USER_ID, text, parse_mode='HTML')
+        bot.send_message(chat_id, text, parse_mode='HTML')
+        log_notification(text, True)
         print(f"📨 Telegram: {text[:100]}...")
         return True
     except Exception as e:
         print(f"❌ Telegram error: {e}")
+        log_notification(f"Error: {str(e)}", False)
         return False
+
+def log_notification(message, success):
+    """Log notification to database"""
+    db_query(
+        "INSERT INTO notification_log (message, success) VALUES (?, ?)",
+        (message[:500], 1 if success else 0)
+    )
 
 # ============= NOTIFICATION SYSTEM =============
 def check_and_send_notifications():
@@ -148,13 +227,12 @@ def check_and_send_notifications():
             AND notify_enabled = 1
             AND datetime(start_time) > datetime('now', '-1 hour')
             ORDER BY start_time
-        ''')
+        ''', fetch_all=True)
         
         print(f"📋 Found {len(tasks)} active tasks")
         
         for task_row in tasks:
             try:
-                # Convert Row to dict
                 task = row_to_dict(task_row)
                 if not task:
                     continue
@@ -207,8 +285,8 @@ def check_and_send_notifications():
         import traceback
         traceback.print_exc()
 
-def send_daily_summary():
-    """Send daily task summary"""
+def send_hourly_report():
+    """Send hourly task status report"""
     try:
         now = get_ist_time()
         today = now.strftime('%Y-%m-%d')
@@ -218,35 +296,95 @@ def send_daily_summary():
             SELECT * FROM tasks 
             WHERE date(start_time) = ?
             ORDER BY start_time
-        ''', (today,))
+        ''', (today,), fetch_all=True)
         
-        if not tasks:
-            message = f"📅 <b>Daily Summary - {now.strftime('%B %d, %Y')}</b>\n"
-            message += "No tasks for today! 🎉\n"
-            message += f"⏰ {now.strftime('%I:%M %p')} IST"
-            send_telegram_message(message)
+        # Get setting
+        setting = db_query("SELECT value FROM settings WHERE key = 'hourly_report'", fetch_one=True)
+        if not setting or setting['value'] != '1':
             return
         
-        completed = sum(1 for t in tasks if t['completed'])
-        total = len(tasks)
-        
-        message = f"📅 <b>Daily Summary - {now.strftime('%B %d, %Y')}</b>\n"
-        message += f"📊 {completed}/{total} tasks completed\n"
-        message += f"⏰ {now.strftime('%I:%M %p')} IST\n\n"
-        
-        for task_row in tasks:
-            task = row_to_dict(task_row)
-            if not task:
-                continue
-            status = "✅" if task['completed'] else "❌"
-            start_time = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
-            start_time = IST.localize(start_time)
-            message += f"{status} {task['title']} ({start_time.strftime('%I:%M %p')})\n"
+        if not tasks:
+            message = f"📊 <b>Hourly Report</b>\n"
+            message += f"🕐 Time: {now.strftime('%I:%M %p')} IST\n"
+            message += f"📅 Date: {now.strftime('%B %d, %Y')}\n"
+            message += "✅ No active tasks for today!"
+        else:
+            completed = sum(1 for t in tasks if t['completed'])
+            total = len(tasks)
+            
+            message = f"📊 <b>Hourly Report</b>\n"
+            message += f"🕐 Time: {now.strftime('%I:%M %p')} IST\n"
+            message += f"📅 Date: {now.strftime('%B %d, %Y')}\n"
+            message += f"📋 Tasks: {completed}/{total} completed\n\n"
+            
+            for task in tasks:
+                status = "✅" if task['completed'] else "⏳"
+                start_time = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
+                start_time = IST.localize(start_time)
+                end_time = datetime.strptime(task['end_time'], '%Y-%m-%d %H:%M:%S')
+                end_time = IST.localize(end_time)
+                
+                # Get subtask progress
+                subtasks = db_query('SELECT * FROM subtasks WHERE task_id = ?', (task['id'],), fetch_all=True)
+                completed_subtasks = sum(1 for st in subtasks if st['completed'])
+                total_subtasks = len(subtasks)
+                
+                progress = f" ({completed_subtasks}/{total_subtasks})" if total_subtasks > 0 else ""
+                
+                message += f"{status} <b>{task['title']}</b>{progress}\n"
+                message += f"   ⏰ {start_time.strftime('%I:%M')} - {end_time.strftime('%I:%M %p')}\n"
         
         send_telegram_message(message)
         
     except Exception as e:
-        print(f"❌ Daily summary error: {e}")
+        print(f"❌ Hourly report error: {e}")
+
+def check_note_notifications():
+    """Check and send note notifications based on interval"""
+    try:
+        now = get_ist_time()
+        
+        notes = db_query('''
+            SELECT * FROM notes 
+            WHERE notify_enabled = 1 
+            AND notify_interval > 0
+        ''', fetch_all=True)
+        
+        for note in notes:
+            note_id = note['id']
+            interval_hours = note['notify_interval']
+            last_notified = note['last_notified']
+            
+            should_notify = False
+            
+            if last_notified:
+                last_time = datetime.strptime(last_notified, '%Y-%m-%d %H:%M:%S')
+                last_time = IST.localize(last_time)
+                hours_since = (now - last_time).total_seconds() / 3600
+                should_notify = hours_since >= interval_hours
+            else:
+                should_notify = True
+            
+            if should_notify:
+                message = f"📝 <b>Note Reminder</b>\n"
+                message += f"📌 <b>{note['title']}</b>\n"
+                message += f"🔄 Interval: Every {interval_hours} hours\n"
+                message += f"⏰ Time: {now.strftime('%I:%M %p')} IST\n"
+                
+                if note['description']:
+                    desc = note['description'][:200]
+                    if len(note['description']) > 200:
+                        desc += "..."
+                    message += f"\n{desc}"
+                
+                if send_telegram_message(message):
+                    db_query(
+                        "UPDATE notes SET last_notified = ? WHERE id = ?",
+                        (now.strftime('%Y-%m-%d %H:%M:%S'), note_id)
+                    )
+                    
+    except Exception as e:
+        print(f"❌ Note notification error: {e}")
 
 def scheduler_thread():
     """Run scheduler in background thread"""
@@ -257,19 +395,17 @@ def scheduler_thread():
             # Check notifications every minute
             check_and_send_notifications()
             
-            # Check for daily summary at 8:00 AM IST
+            # Check note notifications
+            check_note_notifications()
+            
+            # Check for hourly report
             now = get_ist_time()
             
-            # Debug: Print current time
-            if now.minute % 15 == 0:  # Every 15 minutes
-                print(f"⏰ Current IST time: {now.strftime('%H:%M:%S')}")
-            
-            if now.hour == 8 and now.minute == 0:
-                setting = db_query("SELECT value FROM settings WHERE key = 'daily_summary'", fetch_one=True)
-                if setting and setting['value'] == '1':
-                    print("📅 Sending daily summary...")
-                    send_daily_summary()
-                    time.sleep(120)  # Sleep 2 minutes to avoid duplicate
+            # Send hourly report at minute 0
+            if now.minute == 0:
+                print("📊 Sending hourly report...")
+                send_hourly_report()
+                time.sleep(60)  # Sleep 1 minute to avoid duplicate
             
             # Calculate seconds until next minute
             seconds_to_wait = 60 - now.second
@@ -286,12 +422,23 @@ scheduler.start()
 # ============= TELEGRAM BOT COMMANDS =============
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    """Send welcome message"""
+    """Send welcome message with inline buttons"""
     if str(message.chat.id) != USER_ID:
         bot.reply_to(message, "❌ Unauthorized")
         return
     
     now = get_ist_time()
+    
+    # Create inline keyboard
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("📋 Today's Tasks", callback_data='today_tasks'),
+        InlineKeyboardButton("➕ Add Task", callback_data='add_task'),
+        InlineKeyboardButton("📊 Summary", callback_data='summary'),
+        InlineKeyboardButton("⏰ Current Time", callback_data='current_time'),
+        InlineKeyboardButton("🔄 Test Notification", callback_data='test_notification'),
+        InlineKeyboardButton("🌐 Open Web App", web_app=WebAppInfo(url=f"https://patient-maxie-sandip232-786edcb8.koyeb.app/"))
+    )
     
     welcome = f"""
 🤖 <b>Task Tracker Bot</b>
@@ -304,7 +451,6 @@ def send_welcome(message):
 /summary - Get daily summary
 /test - Test notification
 /time - Check current IST time
-/help - Show this message
 
 <b>Notifications:</b>
 • 1 notification per minute for 10 minutes before task starts
@@ -313,7 +459,97 @@ def send_welcome(message):
 <b>Web Interface:</b>
 https://patient-maxie-sandip232-786edcb8.koyeb.app/
 """
-    bot.reply_to(message, welcome, parse_mode='HTML')
+    bot.send_message(message.chat.id, welcome, parse_mode='HTML', reply_markup=keyboard)
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback_query(call):
+    """Handle inline button callbacks"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    
+    if str(chat_id) != USER_ID:
+        bot.answer_callback_query(call.id, "❌ Unauthorized")
+        return
+    
+    if call.data == 'today_tasks':
+        send_today_tasks_callback(chat_id, message_id)
+    elif call.data == 'add_task':
+        bot.answer_callback_query(call.id, "Use /add command to add tasks")
+    elif call.data == 'summary':
+        send_daily_summary_callback(chat_id)
+    elif call.data == 'current_time':
+        send_current_time_callback(chat_id)
+    elif call.data == 'test_notification':
+        send_test_notification_callback(chat_id)
+    
+    bot.answer_callback_query(call.id)
+
+def send_today_tasks_callback(chat_id, message_id):
+    """Send today's tasks via callback"""
+    now = get_ist_time()
+    today = now.strftime('%Y-%m-%d')
+    tasks = db_query('''
+        SELECT * FROM tasks 
+        WHERE date(start_time) = ?
+        ORDER BY start_time
+    ''', (today,), fetch_all=True)
+    
+    if not tasks:
+        bot.edit_message_text(
+            f"📅 No tasks for today ({now.strftime('%B %d')})",
+            chat_id, message_id, parse_mode='HTML'
+        )
+        return
+    
+    response = f"📅 <b>Today's Tasks ({now.strftime('%B %d')})</b>\n"
+    response += f"⏰ {now.strftime('%I:%M %p')} IST\n\n"
+    
+    for task in tasks:
+        status = "✅" if task['completed'] else "❌"
+        start_time = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
+        start_time = IST.localize(start_time)
+        end_time = datetime.strptime(task['end_time'], '%Y-%m-%d %H:%M:%S')
+        end_time = IST.localize(end_time)
+        
+        # Get subtask progress
+        subtasks = db_query('SELECT * FROM subtasks WHERE task_id = ?', (task['id'],), fetch_all=True)
+        completed_subtasks = sum(1 for st in subtasks if st['completed'])
+        total_subtasks = len(subtasks)
+        
+        progress = f" ({completed_subtasks}/{total_subtasks})" if total_subtasks > 0 else ""
+        
+        response += f"{status} <b>{task['title']}</b>{progress}\n"
+        response += f"   ⏰ {start_time.strftime('%I:%M')} - {end_time.strftime('%I:%M %p')}\n\n"
+    
+    bot.edit_message_text(response, chat_id, message_id, parse_mode='HTML')
+
+def send_daily_summary_callback(chat_id):
+    """Send daily summary via callback"""
+    send_daily_summary()
+    bot.send_message(chat_id, "📊 Summary sent!", parse_mode='HTML')
+
+def send_current_time_callback(chat_id):
+    """Send current IST time via callback"""
+    now = get_ist_time()
+    time_msg = f"⏰ <b>Current Time</b>\n"
+    time_msg += f"IST: {now.strftime('%I:%M:%S %p')}\n"
+    time_msg += f"Date: {now.strftime('%B %d, %Y')}\n"
+    time_msg += f"Timezone: Asia/Kolkata"
+    
+    bot.send_message(chat_id, time_msg, parse_mode='HTML')
+
+def send_test_notification_callback(chat_id):
+    """Send test notification via callback"""
+    now = get_ist_time()
+    test_msg = "🔔 <b>Test Notification</b>\n"
+    test_msg += "✅ Bot is working!\n"
+    test_msg += f"⏰ {now.strftime('%H:%M:%S')} IST\n"
+    test_msg += f"📅 {now.strftime('%B %d, %Y')}"
+    
+    if send_telegram_message(test_msg, chat_id):
+        bot.send_message(chat_id, "✅ Test notification sent!", parse_mode='HTML')
+    else:
+        bot.send_message(chat_id, "❌ Failed to send test", parse_mode='HTML')
 
 @bot.message_handler(commands=['today'])
 def send_today_tasks(message):
@@ -327,7 +563,7 @@ def send_today_tasks(message):
         SELECT * FROM tasks 
         WHERE date(start_time) = ?
         ORDER BY start_time
-    ''', (today,))
+    ''', (today,), fetch_all=True)
     
     if not tasks:
         bot.reply_to(message, f"📅 No tasks for today ({now.strftime('%B %d')})")
@@ -336,10 +572,7 @@ def send_today_tasks(message):
     response = f"📅 <b>Today's Tasks ({now.strftime('%B %d')})</b>\n"
     response += f"⏰ {now.strftime('%I:%M %p')} IST\n\n"
     
-    for task_row in tasks:
-        task = row_to_dict(task_row)
-        if not task:
-            continue
+    for task in tasks:
         status = "✅" if task['completed'] else "❌"
         start_time = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
         start_time = IST.localize(start_time)
@@ -451,6 +684,44 @@ def send_time(message):
     
     bot.reply_to(message, time_msg, parse_mode='HTML')
 
+def send_daily_summary():
+    """Send daily task summary"""
+    try:
+        now = get_ist_time()
+        today = now.strftime('%Y-%m-%d')
+        
+        # Get today's tasks
+        tasks = db_query('''
+            SELECT * FROM tasks 
+            WHERE date(start_time) = ?
+            ORDER BY start_time
+        ''', (today,), fetch_all=True)
+        
+        if not tasks:
+            message = f"📅 <b>Daily Summary - {now.strftime('%B %d, %Y')}</b>\n"
+            message += "No tasks for today! 🎉\n"
+            message += f"⏰ {now.strftime('%I:%M %p')} IST"
+            send_telegram_message(message)
+            return
+        
+        completed = sum(1 for t in tasks if t['completed'])
+        total = len(tasks)
+        
+        message = f"📅 <b>Daily Summary - {now.strftime('%B %d, %Y')}</b>\n"
+        message += f"📊 {completed}/{total} tasks completed\n"
+        message += f"⏰ {now.strftime('%I:%M %p')} IST\n\n"
+        
+        for task in tasks:
+            status = "✅" if task['completed'] else "❌"
+            start_time = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
+            start_time = IST.localize(start_time)
+            message += f"{status} {task['title']} ({start_time.strftime('%I:%M %p')})\n"
+        
+        send_telegram_message(message)
+        
+    except Exception as e:
+        print(f"❌ Daily summary error: {e}")
+
 # ============= WEBHOOK ENDPOINT =============
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -466,107 +737,130 @@ def webhook():
             return 'Error', 500
     return 'Bad Request', 400
 
-# ============= FLASK WEB APP =============
+# ============= HELPER FUNCTIONS =============
+def format_text(text):
+    """Format text with markdown-like syntax"""
+    if not text:
+        return ""
+    
+    # Convert newlines to <br>
+    text = text.replace('\n', '<br>')
+    
+    # Convert *bold* to <strong>
+    import re
+    text = re.sub(r'\*(.*?)\*', r'<strong>\1</strong>', text)
+    
+    # Convert _italic_ to <em>
+    text = re.sub(r'_(.*?)_', r'<em>\1</em>', text)
+    
+    return text
+
+def calculate_time_status(start_time, end_time, is_active, completed):
+    """Calculate time status for display"""
+    if completed:
+        return {
+            'text': 'Completed',
+            'status': 'completed',
+            'class': 'upcoming'
+        }
+    
+    if not is_active:
+        return {
+            'text': 'Inactive',
+            'status': 'inactive',
+            'class': 'upcoming'
+        }
+    
+    now = get_ist_time()
+    start_dt = datetime.strptime(start_time, '%Y-%m-%d %H:%M:%S')
+    start_dt = IST.localize(start_dt)
+    end_dt = datetime.strptime(end_time, '%Y-%m-%d %H:%M:%S')
+    end_dt = IST.localize(end_dt)
+    
+    # Convert to minutes for easier comparison
+    current_minutes = now.hour * 60 + now.minute
+    start_minutes = start_dt.hour * 60 + start_dt.minute
+    end_minutes = end_dt.hour * 60 + end_dt.minute
+    
+    two_hours = 120  # 2 hours in minutes
+    
+    if current_minutes < (start_minutes - two_hours):
+        # More than 2 hours before start
+        return {
+            'text': 'Upcoming',
+            'status': 'upcoming',
+            'class': 'upcoming'
+        }
+    elif current_minutes >= (start_minutes - two_hours) and current_minutes < start_minutes:
+        # Within 2 hours of start
+        minutes_before = start_minutes - current_minutes
+        hours = minutes_before // 60
+        minutes = minutes_before % 60
+        
+        if hours > 0:
+            return {
+                'text': f'Starts in {hours}h {minutes}m',
+                'status': 'starting_soon',
+                'class': 'starting_soon'
+            }
+        else:
+            return {
+                'text': f'Starts in {minutes}m',
+                'status': 'starting_soon',
+                'class': 'starting_soon'
+            }
+    elif current_minutes >= start_minutes and current_minutes <= end_minutes:
+        # During task time
+        minutes_left = end_minutes - current_minutes
+        hours = minutes_left // 60
+        minutes = minutes_left % 60
+        
+        if hours > 0:
+            return {
+                'text': f'{hours}h {minutes}m left',
+                'status': 'active',
+                'class': 'active'
+            }
+        else:
+            return {
+                'text': f'{minutes}m left',
+                'status': 'active',
+                'class': 'active'
+            }
+    elif current_minutes > end_minutes and current_minutes <= (end_minutes + two_hours):
+        # Within 2 hours after end
+        minutes_over = current_minutes - end_minutes
+        hours = minutes_over // 60
+        minutes = minutes_over % 60
+        
+        if hours > 0:
+            return {
+                'text': f'Due by {hours}h {minutes}m',
+                'status': 'due',
+                'class': 'due'
+            }
+        else:
+            return {
+                'text': f'Due by {minutes}m',
+                'status': 'due',
+                'class': 'due'
+            }
+    else:
+        # More than 2 hours after end
+        return {
+            'text': 'Overdue',
+            'status': 'overdue',
+            'class': 'overdue'
+        }
+
+# ============= FLASK ROUTES =============
 @app.route('/')
 def index():
     """Main web interface"""
-    # Check if logged in
-    logged_in = request.cookies.get('logged_in') == 'true'
-    
-    if not logged_in:
-        return render_template_string('''
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Task Tracker - Login</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <style>
-                body {
-                    font-family: -apple-system, sans-serif;
-                    margin: 0;
-                    padding: 20px;
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    min-height: 100vh;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                }
-                .login-box {
-                    background: white;
-                    padding: 30px;
-                    border-radius: 15px;
-                    box-shadow: 0 10px 30px rgba(0,0,0,0.2);
-                    width: 100%;
-                    max-width: 350px;
-                }
-                h1 {
-                    color: #333;
-                    text-align: center;
-                    margin-bottom: 30px;
-                    font-size: 24px;
-                }
-                .logo {
-                    text-align: center;
-                    font-size: 48px;
-                    color: #667eea;
-                    margin-bottom: 20px;
-                }
-                input {
-                    width: 100%;
-                    padding: 12px;
-                    margin: 10px 0;
-                    border: 2px solid #ddd;
-                    border-radius: 8px;
-                    font-size: 16px;
-                }
-                input:focus {
-                    outline: none;
-                    border-color: #667eea;
-                }
-                button {
-                    width: 100%;
-                    padding: 14px;
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    color: white;
-                    border: none;
-                    border-radius: 8px;
-                    cursor: pointer;
-                    font-size: 16px;
-                    font-weight: 600;
-                    margin-top: 10px;
-                }
-                .error {
-                    color: #ff4757;
-                    text-align: center;
-                    margin: 10px 0;
-                    font-size: 14px;
-                }
-                .info {
-                    text-align: center;
-                    color: #666;
-                    font-size: 14px;
-                    margin-top: 20px;
-                }
-            </style>
-        </head>
-        <body>
-            <div class="login-box">
-                <div class="logo">📱</div>
-                <h1>Task Tracker</h1>
-                <form method="POST" action="/login">
-                    <input type="password" name="code" placeholder="Enter Access Code" required>
-                    <button type="submit">Login</button>
-                </form>
-                {% if error %}
-                <div class="error">{{ error }}</div>
-                {% endif %}
-                <div class="info">
-                    Default code: 1234
-                </div>
-            </div>
-        </body>
-        </html>
-        ''', error=request.args.get('error', ''))
+    # Check if user is logged in (using session)
+    if not session.get('logged_in'):
+        # No login required - auto-login
+        session['logged_in'] = True
     
     # Get current view
     view = request.args.get('view', 'tasks')
@@ -576,815 +870,2174 @@ def index():
     today = now.strftime('%Y-%m-%d')
     
     # Get tasks for today
-    tasks_rows = db_query('''
+    tasks = db_query('''
         SELECT * FROM tasks 
         WHERE date(start_time) = ?
         ORDER BY start_time
-    ''', (today,))
+    ''', (today,), fetch_all=True)
+    
+    # Get all tasks for stats
+    all_tasks = db_query('SELECT * FROM tasks', fetch_all=True)
     
     # Get history
     history = db_query('''
-        SELECT h.*, t.title as task_title 
+        SELECT h.* 
         FROM history h
-        LEFT JOIN tasks t ON h.task_id = t.id
         ORDER BY h.completed_at DESC
         LIMIT 20
-    ''')
+    ''', fetch_all=True)
+    
+    # Get history subtasks
+    history_with_subtasks = []
+    for item in history:
+        item_dict = row_to_dict(item)
+        if item_dict:
+            subtasks = db_query('''
+                SELECT * FROM history_subtasks 
+                WHERE history_id = ?
+            ''', (item_dict['id'],), fetch_all=True)
+            item_dict['subtasks'] = [row_to_dict(st) for st in subtasks]
+            history_with_subtasks.append(item_dict)
+    
+    # Get notes
+    notes = db_query('SELECT * FROM notes ORDER BY priority', fetch_all=True)
     
     # Get settings
     settings = {}
-    setting_rows = db_query("SELECT key, value FROM settings")
+    setting_rows = db_query("SELECT key, value FROM settings", fetch_all=True)
     for row in setting_rows:
         row_dict = row_to_dict(row)
         if row_dict:
             settings[row_dict['key']] = row_dict['value']
     
     # Calculate stats
-    tasks = [row_to_dict(row) for row in tasks_rows if row_to_dict(row)]
     completed_today = sum(1 for t in tasks if t['completed'])
     pending_today = len(tasks) - completed_today
     
     # Process tasks for display
     processed_tasks = []
     for task in tasks:
-        start_dt = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
+        task_dict = row_to_dict(task)
+        if not task_dict:
+            continue
+            
+        # Get subtasks
+        subtasks = db_query('''
+            SELECT * FROM subtasks 
+            WHERE task_id = ?
+            ORDER BY priority
+        ''', (task_dict['id'],), fetch_all=True)
+        
+        completed_subtasks = sum(1 for st in subtasks if st['completed'])
+        total_subtasks = len(subtasks)
+        progress_percentage = round((completed_subtasks / total_subtasks * 100)) if total_subtasks > 0 else 0
+        
+        # Format times
+        start_dt = datetime.strptime(task_dict['start_time'], '%Y-%m-%d %H:%M:%S')
         start_dt = IST.localize(start_dt)
-        end_dt = datetime.strptime(task['end_time'], '%Y-%m-%d %H:%M:%S')
+        end_dt = datetime.strptime(task_dict['end_time'], '%Y-%m-%d %H:%M:%S')
         end_dt = IST.localize(end_dt)
         
-        minutes_until = int((start_dt - now).total_seconds() / 60) if not task['completed'] else None
+        # Calculate time status
+        time_info = calculate_time_status(
+            task_dict['start_time'],
+            task_dict['end_time'],
+            not task_dict['completed'],
+            task_dict['completed']
+        )
         
         processed_tasks.append({
-            'id': task['id'],
-            'title': task['title'],
-            'start_time': task['start_time'],
-            'end_time': task['end_time'],
+            'id': task_dict['id'],
+            'title': task_dict['title'],
+            'description': task_dict['description'],
+            'start_time': task_dict['start_time'],
+            'end_time': task_dict['end_time'],
             'start_display': start_dt.strftime('%I:%M %p'),
             'end_display': end_dt.strftime('%I:%M %p'),
-            'completed': task['completed'],
-            'notify_enabled': task['notify_enabled'],
-            'minutes_until': minutes_until,
-            'is_upcoming': minutes_until is not None and 1 <= minutes_until <= 10
+            'date_range': start_dt.strftime('%b %d'),
+            'time_range': f"{start_dt.strftime('%I:%M %p')} - {end_dt.strftime('%I:%M %p')}",
+            'completed': task_dict['completed'],
+            'notify_enabled': task_dict['notify_enabled'],
+            'priority': task_dict['priority'],
+            'repeat': task_dict['repeat'],
+            'repeat_day': task_dict['repeat_day'],
+            'subtasks': [row_to_dict(st) for st in subtasks],
+            'completed_subtasks': completed_subtasks,
+            'total_subtasks': total_subtasks,
+            'progress_percentage': progress_percentage,
+            'time_status': time_info,
+            'is_active': not task_dict['completed'],
+            'is_completed_repeating': task_dict['repeat'] != 'none' and task_dict['completed']
         })
     
+    # Process notes for display
+    processed_notes = []
+    for note in notes:
+        note_dict = row_to_dict(note)
+        if note_dict:
+            created_at = datetime.strptime(note_dict['created_at'], '%Y-%m-%d %H:%M:%S')
+            updated_at = datetime.strptime(note_dict['updated_at'], '%Y-%m-%d %H:%M:%S')
+            
+            processed_notes.append({
+                'id': note_dict['id'],
+                'title': note_dict['title'],
+                'description': note_dict['description'],
+                'priority': note_dict['priority'],
+                'created_at': note_dict['created_at'],
+                'updated_at': note_dict['updated_at'],
+                'created_display': created_at.strftime('%b %d, %Y'),
+                'updated_display': updated_at.strftime('%b %d, %Y'),
+                'notify_enabled': note_dict['notify_enabled'],
+                'notify_interval': note_dict['notify_interval']
+            })
+    
+    # Render the HTML template
     return render_template_string('''
     <!DOCTYPE html>
-    <html>
+    <html lang="en" id="theme-element">
     <head>
-        <title>Task Tracker</title>
+        <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Task Tracker</title>
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <style>
             :root {
-                --primary: #4361ee;
-                --secondary: #3a0ca3;
-                --success: #4cc9f0;
-                --danger: #f72585;
-                --warning: #f8961e;
+                --primary: #4361ee; --primary-light: #4895ef; --secondary: #3f37c9; --success: #4cc9f0; --danger: #f72585; --warning: #f8961e; --info: #4895ef; --light: #f8f9fa; --dark: #212529; --gray: #6c757d; --gray-light: #adb5bd; --border-radius: 12px; --shadow: 0 4px 6px rgba(0, 0, 0, 0.1); --transition: all 0.3s ease;
+                --pink-bg: rgba(255, 182, 193, 0.1); --blue-bg: rgba(173, 216, 230, 0.15); --blue-bg-hover: rgba(173, 216, 230, 0.25);
+                --note-bg: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+                --note-shadow: 0 8px 32px rgba(31, 38, 135, 0.1);
+                --completed-bg: rgba(108, 117, 125, 0.1);
+                --completed-text: #6c757d;
+                --notify-bg: rgba(248, 150, 30, 0.1);
+                --notify-color: #f8961e;
             }
             
-            * {
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
+            @media (prefers-color-scheme: dark) {
+                :root {
+                    --primary: #5a6ff0; --primary-light: #6a80f2; --secondary: #4f46e5; --success: #5fd3f0; --danger: #ff2d8e; --warning: #ffa94d; --info: #6a80f2; --light: #121212; --dark: #ffffff; --gray: #94a3b8; --gray-light: #475569; --shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+                    --pink-bg: rgba(255, 182, 193, 0.05); --blue-bg: rgba(173, 216, 230, 0.08); --blue-bg-hover: rgba(173, 216, 230, 0.15);
+                    --note-bg: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                    --note-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+                    --completed-bg: rgba(108, 117, 125, 0.2);
+                    --completed-text: #94a3b8;
+                    --notify-bg: rgba(248, 150, 30, 0.2);
+                    --notify-color: #ffa94d;
+                }
             }
             
-            body {
-                font-family: -apple-system, sans-serif;
-                background: #f5f5f7;
-                color: #333;
-                padding-bottom: 80px;
-            }
+            * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+            body { background-color: var(--light); color: var(--dark); transition: var(--transition); min-height: 100vh; display: flex; flex-direction: column; font-size: 14px; }
             
-            /* Header */
-            .header {
-                background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
-                color: white;
-                padding: 15px;
-                position: sticky;
-                top: 0;
-                z-index: 100;
-            }
-            
-            .header-top {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                margin-bottom: 10px;
-            }
-            
-            .header h1 {
-                font-size: 20px;
-                font-weight: 600;
-            }
-            
-            .time-display {
-                font-size: 14px;
-                background: rgba(255,255,255,0.2);
-                padding: 4px 8px;
-                border-radius: 12px;
-            }
-            
-            /* Tabs */
-            .tabs {
-                display: flex;
-                background: rgba(255,255,255,0.1);
-                border-radius: 10px;
-                padding: 3px;
-            }
-            
-            .tab {
-                flex: 1;
-                text-align: center;
-                padding: 8px;
-                border-radius: 8px;
-                font-size: 14px;
-                cursor: pointer;
-            }
-            
-            .tab.active {
-                background: white;
-                color: var(--primary);
-            }
-            
-            /* Content */
-            .content {
-                padding: 15px;
-            }
-            
-            .section {
-                display: none;
-            }
-            
-            .section.active {
-                display: block;
-            }
-            
-            /* Stats */
-            .stats {
-                display: grid;
-                grid-template-columns: repeat(3, 1fr);
-                gap: 10px;
-                margin-bottom: 20px;
-            }
-            
-            .stat-card {
-                background: white;
-                border-radius: 12px;
-                padding: 15px;
-                text-align: center;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.05);
-            }
-            
-            .stat-number {
-                font-size: 24px;
-                font-weight: bold;
-                color: var(--primary);
-            }
-            
-            .stat-label {
-                font-size: 12px;
-                color: #666;
-            }
-            
-            /* Forms */
-            .form-card {
-                background: white;
-                border-radius: 12px;
-                padding: 20px;
-                margin-bottom: 20px;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.05);
-            }
-            
-            .form-title {
-                font-size: 16px;
-                font-weight: 600;
-                margin-bottom: 15px;
-                color: #333;
-            }
-            
-            .form-group {
-                margin-bottom: 15px;
-            }
-            
-            .form-label {
-                display: block;
-                margin-bottom: 5px;
-                font-size: 14px;
-                font-weight: 500;
-            }
-            
-            .form-input {
-                width: 100%;
-                padding: 12px;
-                border: 2px solid #e9ecef;
-                border-radius: 8px;
-                font-size: 16px;
-            }
-            
-            .time-row {
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 10px;
-            }
-            
-            /* Buttons */
-            .btn {
-                padding: 14px;
-                border: none;
-                border-radius: 8px;
-                font-size: 16px;
-                font-weight: 600;
-                cursor: pointer;
-                width: 100%;
-            }
-            
-            .btn-primary {
-                background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
-                color: white;
-            }
-            
-            /* Task Cards */
-            .task-card {
-                background: white;
-                border-radius: 12px;
-                padding: 15px;
-                margin-bottom: 10px;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.05);
-                border-left: 4px solid var(--primary);
-            }
-            
-            .task-card.completed {
-                border-left-color: var(--success);
-                opacity: 0.8;
-            }
-            
-            .task-card.upcoming {
-                border-left-color: var(--warning);
-                animation: pulse 2s infinite;
-            }
-            
-            @keyframes pulse {
-                0%, 100% { opacity: 1; }
-                50% { opacity: 0.9; }
-            }
-            
-            .task-header {
-                display: flex;
-                justify-content: space-between;
-                align-items: flex-start;
-                margin-bottom: 10px;
-            }
-            
-            .task-title {
-                font-size: 16px;
-                font-weight: 600;
-            }
-            
-            .task-status {
-                font-size: 12px;
-                padding: 4px 8px;
-                border-radius: 20px;
-                font-weight: 600;
-            }
-            
-            .status-pending {
-                background: #fff3cd;
-                color: #856404;
-            }
-            
-            .status-completed {
-                background: #d4edda;
-                color: #155724;
-            }
-            
-            .task-time {
-                display: flex;
-                align-items: center;
+            /* Header Styles */
+            .header { 
+                background-color: var(--light); 
+                padding: 8px 16px; 
+                display: flex; 
+                align-items: center; 
+                justify-content: space-around; 
+                box-shadow: var(--shadow); 
+                position: sticky; 
+                top: 0; 
+                z-index: 100; 
                 gap: 8px;
-                color: #666;
-                font-size: 14px;
-                margin: 8px 0;
+                flex-wrap: wrap;
             }
             
-            .task-notice {
-                font-size: 12px;
-                color: var(--warning);
-                margin: 5px 0;
-            }
-            
-            .task-actions {
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 10px;
-                margin-top: 15px;
-            }
-            
-            .action-btn {
-                padding: 10px;
-                border: none;
-                border-radius: 8px;
-                font-size: 14px;
-                cursor: pointer;
+            .header-action-btn {
                 display: flex;
+                flex-direction: row;
                 align-items: center;
                 justify-content: center;
+                background: var(--primary);
+                color: white;
+                border: none;
+                border-radius: 20px;
+                padding: 8px 16px;
+                cursor: pointer;
+                transition: var(--transition);
+                box-shadow: var(--shadow);
                 gap: 8px;
+                flex: 1;
+                max-width: 120px;
+                margin: 0 4px;
             }
             
-            .btn-success {
-                background: var(--success);
-                color: white;
-            }
+            .header-action-btn i { font-size: 1rem; }
+            .header-action-btn span { font-size: 0.8rem; font-weight: 600; }
+            .header-action-btn:hover { background: var(--primary-light); transform: translateY(-2px); }
+            .header-action-btn:active, .action-btn:active, .btn:active, button:active { transform: none !important; box-shadow: var(--shadow) !important; }
             
-            .btn-danger {
-                background: var(--danger);
-                color: white;
+            @media (max-width: 768px) {
+                .header { padding: 8px; gap: 4px; }
+                .header-action-btn { 
+                    width: 100%;
+                    max-width: none;
+                    padding: 10px;
+                    margin: 2px;
+                    border-radius: 12px;
+                }
+                .header-action-btn span { display: block; font-size: 0.75rem; }
+                .header-action-btn i { margin-right: 4px; font-size: 0.9rem; }
             }
-            
-            /* Notification Banner */
-            .notification-banner {
-                background: linear-gradient(135deg, var(--warning) 0%, #ff6b6b 100%);
-                color: white;
-                padding: 12px 15px;
-                border-radius: 12px;
-                margin-bottom: 20px;
-            }
-            
-            /* FAB */
+
+            /* Floating Action Buttons */
             .fab {
                 position: fixed;
-                bottom: 20px;
-                right: 20px;
-                width: 56px;
-                height: 56px;
-                background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+                width: 60px;
+                height: 60px;
+                background-color: var(--primary);
                 color: white;
                 border-radius: 50%;
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                font-size: 24px;
+                font-size: 1.5rem;
+                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
                 cursor: pointer;
-                box-shadow: 0 4px 15px rgba(67, 97, 238, 0.3);
-                z-index: 100;
+                transition: var(--transition);
+                z-index: 1000;
+                border: none;
+            }
+            
+            .fab:hover {
+                background-color: var(--primary-light);
+                transform: scale(1.1);
+                box-shadow: 0 6px 16px rgba(0, 0, 0, 0.3);
+            }
+            
+            .fab-tasks {
+                bottom: 30px;
+                right: 30px;
+            }
+            
+            .fab-notes {
+                bottom: 30px;
+                right: 30px;
+            }
+            
+            @media (max-width: 768px) {
+                .fab {
+                    width: 50px;
+                    height: 50px;
+                    font-size: 1.3rem;
+                }
+                
+                .fab-tasks {
+                    bottom: 20px;
+                    right: 20px;
+                }
+                
+                .fab-notes {
+                    bottom: 20px;
+                    right: 20px;
+                }
+            }
+
+            .main-content { flex-grow: 1; padding: 16px; overflow-y: auto; padding-bottom: 100px; }
+            .view-content { display: none; }
+            .view-content.active { display: block; animation: fadeIn 0.5s ease; }
+            .content-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+            .page-title { font-size: 1.5rem; font-weight: 700; color: var(--dark); }
+            
+            .bucket-header { display: flex; align-items: center; margin: 24px 0 12px; padding-bottom: 8px; border-bottom: 1px solid var(--gray-light); flex-wrap: wrap; gap: 10px;}
+            .bucket-title { font-size: 1.2rem; font-weight: 600; color: var(--dark); display: flex; align-items: center; gap: 8px; }
+            .bucket-count { background-color: var(--primary); color: white; border-radius: 50%; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; font-size: 0.8rem; }
+            
+            .items-container { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; width: 100%; }
+            @media (max-width: 1200px) { .items-container { grid-template-columns: repeat(2, 1fr) !important; } }
+            @media (max-width: 768px) { .items-container { grid-template-columns: 1fr !important; } }
+            
+            .task-card { 
+                background-color: var(--pink-bg); 
+                border-radius: var(--border-radius); 
+                padding: 16px; 
+                box-shadow: var(--shadow); 
+                transition: var(--transition); 
+                animation: slideIn 0.3s ease; 
+                display: flex; 
+                flex-direction: column; 
+                min-height: 140px;
+                position: relative;
+            }
+            
+            .task-card.completed-repeating {
+                background-color: var(--completed-bg);
+                opacity: 0.8;
+            }
+            
+            .task-card.completed-repeating .task-title,
+            .task-card.completed-repeating .task-description,
+            .task-card.completed-repeating .task-date-range,
+            .task-card.completed-repeating .task-time-range,
+            .task-card.completed-repeating .repeat-badge,
+            .task-card.completed-repeating .priority-badge {
+                color: var(--completed-text);
+            }
+            
+            .task-card.completed-repeating .action-btn {
+                background-color: var(--completed-text);
+            }
+            
+            .task-card.completed-repeating .action-btn:hover {
+                background-color: var(--completed-text);
+                transform: scale(1);
+            }
+            
+            .notify-badge {
+                background-color: var(--notify-bg);
+                color: var(--notify-color);
+                padding: 2px 8px;
+                border-radius: 20px;
+                font-size: 0.65rem;
+                font-weight: 600;
+                display: flex;
+                align-items: center;
+                gap: 4px;
+            }
+            
+            .next-occurrence-info {
+                background-color: rgba(67, 97, 238, 0.1);
+                border-radius: 8px;
+                padding: 8px 12px;
+                margin-bottom: 12px;
+                font-size: 0.75rem;
+                color: var(--primary);
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                border-left: 3px solid var(--primary);
+            }
+            
+            .next-occurrence-info i {
+                font-size: 0.9rem;
+            }
+            
+            @media (prefers-color-scheme: dark) {
+                .task-card {
+                    box-shadow: rgba(255, 255, 255, 0.05) 0px -23px 25px 0px inset, rgba(255, 255, 255, 0.04) 0px -36px 30px 0px inset, rgba(255, 255, 255, 0.03) 0px -79px 40px 0px inset, rgba(255, 255, 255, 0.02) 0px 2px 1px, rgba(255, 255, 255, 0.02) 0px 4px 2px, rgba(255, 255, 255, 0.02) 0px 8px 4px, rgba(255, 255, 255, 0.02) 0px 16px 8px, rgba(255, 255, 255, 0.02) 0px 32px 16px;
+                }
+            }
+            
+            .task-card:hover { transform: translateY(-5px); box-shadow: 0 10px 15px rgba(0, 0, 0, 0.1); }
+            
+            .task-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 8px; }
+            .task-title { font-size: 1rem !important; font-weight: 600; color: var(--dark); margin-bottom: 4px; line-height: 1.4 !important; }
+            .task-description { font-size: 0.8rem !important; color: var(--gray); margin-bottom: 12px; line-height: 1.4 !important; flex-grow: 1; }
+            .task-description:empty { display: none !important; margin-bottom: 0 !important; }
+            
+            .task-actions { display: flex; gap: 8px; }
+            .action-btn { background-color: var(--primary); color: white; border: none; border-radius: 50%; width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: var(--transition); font-size: 0.8rem; }
+            .action-btn:hover { background-color: var(--primary); transform: scale(1.1); }
+            
+            .action-btn.disabled {
+                background-color: var(--gray-light);
+                cursor: not-allowed;
+                opacity: 0.6;
+            }
+            
+            .action-btn.disabled:hover {
+                transform: none;
+                background-color: var(--gray-light);
+            }
+            
+            .task-meta { display: flex; align-items: center; justify-content: space-between; font-size: 0.75rem; color: var(--gray); margin-top: auto; padding-top: 12px; }
+            .repeat-badge { background-color: rgba(67, 97, 238, 0.1); color: var(--primary); padding: 2px 8px; border-radius: 20px; font-size: 0.65rem; font-weight: 600; display: flex; align-items: center; gap: 4px; }
+            .priority-badge { background-color: rgba(108, 117, 125, 0.2); color: var(--gray); padding: 2px 8px; border-radius: 20px; font-size: 0.65rem; font-weight: 600; display: flex; align-items: center; gap: 4px; }
+            
+            .task-date-range { font-size: 0.75rem; color: var(--gray); margin-right: 8px; }
+            .task-time-range { font-size: 0.75rem; color: var(--gray); font-weight: 500; }
+            
+            .subtask-number-badge { width: 22px; height: 22px; border-radius: 50%; background-color: var(--gray-light); color: var(--dark); display: flex; align-items: center; justify-content: center; font-size: 0.7rem; font-weight: bold; transition: var(--transition); }
+            .subtask-number-badge.completed { background-color: var(--primary); color: white; }
+            .subtask-complete-btn { background: none; border: none; cursor: pointer; padding: 0; margin-right: 8px;}
+            .edit-subtask-btn, .delete-subtask-btn { background: none; border: none; color: var(--primary); cursor: pointer; font-size: 0.7rem; opacity: 0.7; transition: var(--transition); padding: 2px 4px; }
+            .edit-subtask-btn:hover, .delete-subtask-btn:hover { opacity: 1; transform: scale(1.1); }
+            .delete-subtask-btn { color: var(--danger); }
+
+            .subtasks-details { margin-top: 12px; border-top: 1px solid var(--gray-light); padding-top: 12px; }
+            .subtasks-details summary { cursor: pointer; display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 0.85rem; color: var(--primary); padding: 4px 0; transition: var(--transition); }
+            .subtasks-details summary:hover { color: var(--primary-light); }
+            .details-toggle { margin-left: auto; transition: var(--transition); }
+            .subtasks-details[open] .details-toggle { transform: rotate(90deg); }
+            .subtasks-content { margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(0,0,0,0.05); }
+            @media (prefers-color-scheme: dark) {
+                .subtasks-content { border-top-color: rgba(255,255,255,0.05); }
+            }
+            .subtask-item { display: flex; align-items: flex-start; margin-bottom: 8px; padding: 8px; background: rgba(0,0,0,0.03); border-radius: 6px; }
+            @media (prefers-color-scheme: dark) {
+                .subtask-item { background: rgba(255,255,255,0.05); }
+            }
+            .subtask-details-container { flex: 1; margin-right: 8px;}
+            .subtask-title { font-size: 0.85rem; color: var(--dark); cursor: pointer; }
+            .subtask-completed { text-decoration: line-through; color: var(--gray); }
+            .subtask-description { font-size: 0.75rem; color: var(--gray); margin-top: 4px; padding-left: 8px; border-left: 2px solid var(--primary-light); line-height: 1.4; }
+            .subtask-actions { display: flex; align-items: center; margin-left: auto; }
+            
+            .progress-display-container { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+            .progress-bar-container { flex: 1; background: var(--gray-light); border-radius: 20px; height: 10px; overflow: hidden; }
+            .progress-bar-fill { height: 100%; background: var(--primary); transition: width 0.3s ease; }
+            .progress-circle { width: 36px; height: 36px; border-radius: 50%; background: conic-gradient(var(--primary) 0%, var(--gray-light) 0%); display: flex; align-items: center; justify-content: center; position: relative; flex-shrink: 0; }
+            .progress-circle::before { content: ''; position: absolute; width: 26px; height: 26px; background-color: var(--light); border-radius: 50%; }
+            .progress-text { font-size: 0.75rem; color: var(--gray); }
+            
+            .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.5); z-index: 1000; align-items: center; justify-content: center; animation: fadeIn 0.3s ease; }
+            .modal-content { background-color: var(--light); border-radius: var(--border-radius); width: 90%; max-width: 500px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2); animation: scaleIn 0.3s ease; overflow: hidden; max-height: 90vh; overflow-y: auto; }
+            .modal-header { padding: 16px; border-bottom: 1px solid var(--gray-light); display: flex; align-items: center; justify-content: space-between; }
+            .modal-title { font-size: 1.2rem; font-weight: 600; color: var(--dark); }
+            .close-modal { background: none; border: none; font-size: 1.3rem; color: var(--gray); cursor: pointer; transition: var(--transition); }
+            .close-modal:hover { color: var(--danger); }
+            .modal-body { padding: 16px; }
+            .form-group { margin-bottom: 12px; }
+            .form-label { display: block; margin-bottom: 4px; font-weight: 600; color: var(--dark); font-size: 0.9rem; }
+            .form-input, .form-select, .form-textarea { width: 100%; padding: 8px; border: 1px solid var(--gray-light); border-radius: 6px; background-color: var(--light); color: var(--dark); transition: var(--transition); font-size: 0.9rem; }
+            .form-input:focus, .form-select:focus, .form-textarea:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(67, 97, 238, 0.2); }
+            .form-textarea { min-height: 80px; resize: vertical; line-height: 1.4; }
+            .form-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+            .btn { padding: 8px 16px; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; transition: var(--transition); font-size: 0.9rem; }
+            .btn-primary { background-color: var(--primary); color: white; }
+            .btn-primary:hover { background-color: var(--secondary); }
+            .btn-secondary { background-color: var(--gray-light); color: white; }
+            .btn-secondary:hover { background-color: var(--gray); }
+            .time-input-group { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+            .date-input-group { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+            
+            .checkbox-group { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+            .checkbox-label { font-weight: 500; color: var(--dark); }
+            .form-checkbox { width: 18px; height: 18px; }
+            
+            /* History styles */
+            .history-date-details { margin-bottom: 15px; }
+            .history-date-summary { padding: 12px 16px; background-color: var(--blue-bg); border-radius: var(--border-radius); cursor: pointer; font-weight: 600; display: flex; align-items: center; gap: 10px; transition: var(--transition); border: 1px solid transparent; }
+            .history-date-summary:hover { background-color: var(--blue-bg-hover); border-color: var(--primary-light); }
+            .history-date-content { padding: 10px 0 0 15px; }
+            .history-items-container { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; margin: 10px 0; }
+            .history-card { background-color: var(--blue-bg); border-radius: var(--border-radius); padding: 16px; box-shadow: var(--shadow); transition: var(--transition); border: 1px solid rgba(0,0,0,0.05); border-left: 4px solid var(--success); }
+            .history-card:hover { transform: translateY(-3px); box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15); }
+            .history-card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 10px; }
+            .history-card-title { font-weight: 600; color: var(--dark); font-size: 0.8rem; display: flex; align-items: center; gap: 8px; flex: 1; }
+            .history-card-title i { color: var(--primary); font-size: 0.9rem; }
+            .history-card-time { font-size: 0.75rem; color: var(--gray); background: rgba(0,0,0,0.05); padding: 3px 8px; border-radius: 12px; white-space: nowrap; margin-left: 10px; }
+            .history-card-description { font-size: 0.8rem; color: var(--gray); margin-bottom: 12px; line-height: 1.4; }
+            .history-card-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+            .history-meta-item { background: rgba(0,0,0,0.05); color: var(--gray); padding: 3px 8px; border-radius: 12px; font-size: 0.75rem; font-weight: 500; }
+            .history-subitems { margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(0,0,0,0.1); }
+            .history-stage-item { font-size: 0.8rem; color: var(--gray); margin-bottom: 8px; padding: 8px; background: rgba(0,0,0,0.03); border-radius: 6px; }
+            .history-stage-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+            .history-stage-title { font-weight: 600; color: var(--dark); flex: 1; }
+            .history-stage-description { font-size: 0.75rem; color: var(--gray); margin-top: 4px; padding-left: 8px; border-left: 2px solid var(--success); line-height: 1.4; }
+            
+            @media (prefers-color-scheme: dark) {
+                .history-card { background-color: rgba(173, 216, 230, 0.08); border: 1px solid rgba(255,255,255,0.05); }
+                .history-card-time, .history-meta-item { background: rgba(255,255,255,0.1); }
+                .history-subitems { border-top-color: rgba(255,255,255,0.1); }
+                .history-stage-item { background: rgba(255,255,255,0.05); }
+            }
+            
+            /* Notes Styles */
+            .notes-container { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+            .note-card {
+                background: var(--note-bg);
+                border-radius: var(--border-radius);
+                padding: 0;
+                box-shadow: var(--note-shadow);
+                transition: var(--transition);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                backdrop-filter: blur(10px);
+            }
+            
+            .note-card:hover {
+                transform: translateY(-5px);
+                box-shadow: 0 12px 24px rgba(0, 0, 0, 0.15);
+            }
+            
+            .note-details {
+                width: 100%;
+            }
+            
+            .note-summary {
+                list-style: none;
+                padding: 20px;
+                cursor: pointer;
+            }
+            
+            .note-summary::-webkit-details-marker {
+                display: none;
+            }
+            
+            .note-header {
+                margin-bottom: 0;
+                padding-bottom: 0;
+                border-bottom: none;
+            }
+            
+            .note-title {
+                font-size: 1.1rem;
+                font-weight: 700;
+                color: var(--dark);
+                margin-bottom: 4px;
+                line-height: 1.3;
+            }
+            
+            .note-date {
+                font-size: 0.75rem;
+                color: var(--gray);
+                font-weight: 500;
+            }
+            
+            .note-content {
+                padding: 0 20px 20px 20px;
+            }
+            
+            .note-description {
+                font-size: 0.9rem;
+                color: var(--dark);
+                line-height: 1.5;
+                margin-bottom: 16px;
+            }
+            
+            .note-description strong {
+                font-weight: 700;
+                color: var(--primary);
+            }
+            
+            .note-description em {
+                font-style: italic;
+                color: var(--secondary);
+            }
+            
+            .note-footer {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-top: auto;
+                padding-top: 12px;
+                border-top: 1px solid rgba(0,0,0,0.05);
+            }
+            
+            @media (prefers-color-scheme: dark) {
+                .note-footer {
+                    border-top-color: rgba(255,255,255,0.05);
+                }
+            }
+            
+            .note-meta {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            
+            .note-date-badge {
+                background: rgba(67, 97, 238, 0.1);
+                color: var(--primary);
+                padding: 4px 8px;
+                border-radius: 12px;
+                font-size: 0.7rem;
+                font-weight: 500;
+            }
+            
+            .note-actions {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }
+            
+            .note-action-btn, .note-move-btn {
+                background: none;
+                border: none;
+                color: var(--primary);
+                cursor: pointer;
+                font-size: 0.9rem;
+                transition: var(--transition);
+                opacity: 0.7;
+                padding: 4px;
+                border-radius: 4px;
+            }
+            
+            .note-action-btn:hover, .note-move-btn:hover {
+                opacity: 1;
+                transform: scale(1.1);
+                background: rgba(67, 97, 238, 0.1);
+            }
+            
+            .note-action-btn.delete {
+                color: var(--danger);
+            }
+            
+            .note-action-btn.delete:hover {
+                background: rgba(247, 37, 133, 0.1);
+            }
+            
+            /* Settings View */
+            .settings-card {
+                background: var(--blue-bg);
+                border-radius: var(--border-radius);
+                padding: 24px;
+                margin-bottom: 20px;
+                box-shadow: var(--shadow);
+            }
+            
+            .settings-title {
+                font-size: 1.2rem;
+                font-weight: 600;
+                color: var(--dark);
+                margin-bottom: 16px;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }
+            
+            .settings-item {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 12px 0;
+                border-bottom: 1px solid rgba(0,0,0,0.1);
+            }
+            
+            .settings-item:last-child {
+                border-bottom: none;
+            }
+            
+            .settings-label {
+                font-weight: 500;
+                color: var(--dark);
+            }
+            
+            .toggle-switch {
+                position: relative;
+                display: inline-block;
+                width: 50px;
+                height: 24px;
+            }
+            
+            .toggle-switch input {
+                opacity: 0;
+                width: 0;
+                height: 0;
+            }
+            
+            .toggle-slider {
+                position: absolute;
+                cursor: pointer;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background-color: var(--gray-light);
+                transition: .4s;
+                border-radius: 24px;
+            }
+            
+            .toggle-slider:before {
+                position: absolute;
+                content: "";
+                height: 16px;
+                width: 16px;
+                left: 4px;
+                bottom: 4px;
+                background-color: white;
+                transition: .4s;
+                border-radius: 50%;
+            }
+            
+            input:checked + .toggle-slider {
+                background-color: var(--success);
+            }
+            
+            input:checked + .toggle-slider:before {
+                transform: translateX(26px);
+            }
+            
+            .empty-state { text-align: center; padding: 32px 16px; color: var(--gray); }
+            .empty-state i { font-size: 2.5rem; margin-bottom: 12px; opacity: 0.5; }
+            
+            .time-remaining-badge { background-color: rgba(67, 97, 238, 0.1); color: var(--primary); padding: 4px 8px; border-radius: 12px; font-size: 0.7rem; font-weight: 600; }
+            .time-remaining-badge.upcoming { background-color: rgba(108, 117, 125, 0.2); color: var(--gray); }
+            .time-remaining-badge.starting_soon { background-color: rgba(248, 150, 30, 0.1); color: var(--warning); }
+            .time-remaining-badge.active { background-color: rgba(76, 201, 240, 0.2); color: var(--success); }
+            .time-remaining-badge.due { background-color: rgba(248, 150, 30, 0.1); color: var(--warning); }
+            .time-remaining-badge.overdue { background-color: rgba(247, 37, 133, 0.1); color: var(--danger); }
+            .time-remaining-badge.expired { background-color: rgba(108, 117, 125, 0.2); color: var(--gray); }
+            
+            @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+            @keyframes scaleIn { from { opacity: 0; transform: scale(0.9); } to { opacity: 1; transform: scale(1); } }
+            @keyframes slideIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+            
+            @media (max-width: 768px) {
+                .history-items-container { grid-template-columns: 1fr; }
+                .notes-container { grid-template-columns: 1fr; }
+                .task-description, .history-card-description { font-size: 0.75rem; }
+                .task-card { min-height: 120px !important; }
             }
         </style>
     </head>
     <body>
-        <!-- Header -->
         <div class="header">
-            <div class="header-top">
-                <h1><i class="fas fa-tasks"></i> Task Tracker</h1>
-                <div class="time-display">
-                    {{ now.strftime('%I:%M %p') }} IST
-                </div>
-            </div>
-            
-            <div class="tabs">
-                <div class="tab {{ 'active' if view == 'tasks' }}" onclick="switchView('tasks')">
-                    <i class="fas fa-list"></i> Tasks
-                </div>
-                <div class="tab {{ 'active' if view == 'history' }}" onclick="switchView('history')">
-                    <i class="fas fa-history"></i> History
-                </div>
-                <div class="tab {{ 'active' if view == 'settings' }}" onclick="switchView('settings')">
-                    <i class="fas fa-cog"></i> Settings
-                </div>
-            </div>
+            <button class="header-action-btn" onclick="switchView('tasks')" title="Tasks">
+                <i class="fas fa-tasks"></i>
+                <span>Tasks</span>
+            </button>
+            <button class="header-action-btn" onclick="switchView('notes')" title="Notes">
+                <i class="fas fa-wand-magic-sparkles"></i>
+                <span>Notes</span>
+            </button>
+            <button class="header-action-btn" onclick="switchView('history')" title="History">
+                <i class="fas fa-history"></i>
+                <span>History</span>
+            </button>
+            <button class="header-action-btn" onclick="switchView('settings')" title="Settings">
+                <i class="fas fa-cog"></i>
+                <span>Settings</span>
+            </button>
         </div>
-        
-        <!-- Content -->
-        <div class="content">
+
+        <!-- Show FAB based on current view -->
+        <div id="fabContainer">
+            {% if view == 'tasks' %}
+                <button class="fab fab-tasks" onclick="openAddTaskModal()" title="Add Task">
+                    <i class="fas fa-plus"></i>
+                </button>
+            {% elif view == 'notes' %}
+                <button class="fab fab-notes" onclick="openAddNoteModal()" title="Add Note">
+                    <i class="fas fa-plus"></i>
+                </button>
+            {% endif %}
+        </div>
+
+        <div class="main-content">
             <!-- Tasks View -->
-            <div id="tasksView" class="section {{ 'active' if view == 'tasks' }}">
-                <!-- Notification Banner -->
-                <div class="notification-banner">
-                    <div style="font-weight: 600; margin-bottom: 5px;">
-                        <i class="fas fa-bell"></i> Notifications Active
-                    </div>
-                    <div style="font-size: 12px;">
-                        You'll get 1 notification per minute for 10 minutes before each task starts
-                    </div>
+            <div class="view-content {{ 'active' if view == 'tasks' else '' }}" id="tasksView">
+                <div class="content-header">
+                    <h1 class="page-title">Tasks</h1>
                 </div>
                 
-                <!-- Stats -->
-                <div class="stats">
-                    <div class="stat-card">
-                        <div class="stat-number">{{ tasks|length }}</div>
-                        <div class="stat-label">Total</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number">{{ completed_today }}</div>
-                        <div class="stat-label">Completed</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number">{{ pending_today }}</div>
-                        <div class="stat-label">Pending</div>
-                    </div>
+                <div class="bucket-header">
+                    <h2 class="bucket-title">
+                        <i class="fas fa-tasks"></i>
+                        Active Tasks
+                        <span class="bucket-count">{{ processed_tasks|length }}</span>
+                    </h2>
                 </div>
                 
-                <!-- Add Task Form -->
-                <div class="form-card">
-                    <div class="form-title">
-                        <i class="fas fa-plus-circle"></i> Add New Task (IST)
-                    </div>
-                    <form method="POST" action="/add_task" id="taskForm">
-                        <div class="form-group">
-                            <label class="form-label">Task Title</label>
-                            <input type="text" class="form-input" name="title" placeholder="What needs to be done?" required>
-                        </div>
-                        
-                        <div class="form-group">
-                            <label class="form-label">Time (IST)</label>
-                            <div class="time-row">
-                                <div>
-                                    <input type="time" class="form-input" name="start_time" id="startTime" required>
-                                    <div style="font-size: 11px; color: #666; text-align: center; margin-top: 3px;">Start</div>
-                                </div>
-                                <div>
-                                    <input type="time" class="form-input" name="end_time" id="endTime" required>
-                                    <div style="font-size: 11px; color: #666; text-align: center; margin-top: 3px;">End</div>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <div style="display: flex; align-items: center; gap: 10px; margin: 15px 0;">
-                            <input type="checkbox" name="notify_enabled" id="notifyEnabled" checked style="width: 20px; height: 20px;">
-                            <label for="notifyEnabled" style="font-size: 14px;">Enable notifications</label>
-                        </div>
-                        
-                        <button type="submit" class="btn btn-primary">
-                            <i class="fas fa-plus"></i> Add Task
-                        </button>
-                    </form>
-                </div>
-                
-                <!-- Tasks List -->
-                <div>
-                    <div style="font-size: 16px; font-weight: 600; margin-bottom: 15px; color: #333;">
-                        <i class="fas fa-calendar-day"></i> Today's Tasks
-                        <span style="font-size: 12px; color: #666; font-weight: normal; margin-left: 8px;">
-                            {{ now.strftime('%B %d') }} IST
-                        </span>
-                    </div>
-                    
+                <div class="items-container">
                     {% if not processed_tasks %}
-                    <div style="text-align: center; padding: 40px 20px; color: #666;">
-                        <i class="fas fa-clipboard-list" style="font-size: 48px; opacity: 0.5;"></i>
-                        <p>No tasks for today</p>
+                    <div class="empty-state" style="grid-column: 1 / -1;">
+                        <i class="fas fa-clipboard-list"></i>
+                        <p>No tasks for today. Add a new one to get started!</p>
                     </div>
-                    {% endif %}
-                    
-                    {% for task in processed_tasks %}
-                    <div class="task-card {{ 'completed' if task.completed }} {{ 'upcoming' if task.is_upcoming and not task.completed }}">
-                        <div class="task-header">
-                            <div class="task-title">{{ task.title }}</div>
-                            <div class="task-status {{ 'status-completed' if task.completed else 'status-pending' }}">
-                                {{ '✅ Completed' if task.completed else '⏳ Pending' }}
+                    {% else %}
+                        {% for task in processed_tasks %}
+                        <div class="task-card {{ 'completed-repeating' if task.is_completed_repeating else '' }}">
+                            <div class="task-header">
+                                <div style="flex: 1;">
+                                    <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 4px;">
+                                        <h3 class="task-title">{{ task.title }}</h3>
+                                        <div class="task-actions">
+                                            <button class="action-btn" onclick="openAddSubtaskModal('{{ task.id }}')" title="Add Subtask">
+                                                <i class="fas fa-plus"></i>
+                                            </button>
+                                            <button class="action-btn" onclick="openEditTaskModal('{{ task.id }}')" title="Edit Task">
+                                                <i class="fas fa-edit"></i>
+                                            </button>
+                                            {% if task.is_active %}
+                                            <form method="POST" action="/complete_task" style="display:inline;">
+                                                <input type="hidden" name="task_id" value="{{ task.id }}">
+                                                <button type="submit" class="action-btn" title="Complete">
+                                                    <i class="fas fa-check"></i>
+                                                </button>
+                                            </form>
+                                            {% else %}
+                                            <button class="action-btn disabled" title="Already Completed" disabled>
+                                                <i class="fas fa-check"></i>
+                                            </button>
+                                            {% endif %}
+                                            <form method="POST" action="/delete_task" style="display:inline;">
+                                                <input type="hidden" name="task_id" value="{{ task.id }}">
+                                                <button type="submit" class="action-btn" title="Delete" onclick="return confirm('Delete this task?')">
+                                                    <i class="fas fa-trash"></i>
+                                                </button>
+                                            </form>
+                                        </div>
+                                    </div>
+                                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                                        <div>
+                                            <span class="task-date-range">{{ task.date_range }}</span>
+                                            <span class="task-time-range">{{ task.time_range }}</span>
+                                        </div>
+                                        <div class="time-remaining-badge {{ task.time_status.class }}">
+                                            {{ task.time_status.text }}
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
-                        </div>
-                        
-                        <div class="task-time">
-                            <i class="far fa-clock"></i>
-                            {{ task.start_display }} - {{ task.end_display }} IST
-                        </div>
-                        
-                        {% if task.is_upcoming and not task.completed %}
-                        <div class="task-notice">
-                            <i class="fas fa-bell"></i>
-                            Notifications active: Starts in {{ task.minutes_until }} minute{{ 's' if task.minutes_until > 1 else '' }}
-                        </div>
-                        {% endif %}
-                        
-                        <div class="task-actions">
-                            {% if not task.completed %}
-                            <form method="POST" action="/complete_task" style="display: contents;">
-                                <input type="hidden" name="task_id" value="{{ task.id }}">
-                                <button type="submit" class="action-btn btn-success">
-                                    <i class="fas fa-check"></i> Complete
-                                </button>
-                            </form>
+                            
+                            {% if task.description %}
+                            <p class="task-description">{{ format_text(task.description)|safe }}</p>
                             {% endif %}
                             
-                            <form method="POST" action="/delete_task" style="display: contents;">
-                                <input type="hidden" name="task_id" value="{{ task.id }}">
-                                <button type="submit" class="action-btn btn-danger" onclick="return confirm('Delete this task?')">
-                                    <i class="fas fa-trash"></i> Delete
-                                </button>
-                            </form>
+                            {% if task.is_completed_repeating %}
+                            <div class="next-occurrence-info">
+                                <i class="fas fa-calendar-alt"></i>
+                                Next: Tomorrow at {{ task.start_display }}
+                            </div>
+                            {% endif %}
+                            
+                            {% if task.total_subtasks > 0 %}
+                            <div class="progress-display-container">
+                                <div class="progress-circle" style="background: conic-gradient(var(--primary) {{ task.progress_percentage }}%, var(--gray-light) 0%);">
+                                    <span style="font-size: 0.65rem; z-index: 1;">{{ task.progress_percentage }}%</span>
+                                </div>
+                                <div class="progress-text" style="margin-left: 8px; flex: 1;">
+                                    {{ task.completed_subtasks }} of {{ task.total_subtasks }} subtasks completed
+                                </div>
+                            </div>
+                            {% endif %}
+                            
+                            {% if task.subtasks %}
+                            <details class="subtasks-details">
+                                <summary>
+                                    <i class="fas fa-tasks"></i>
+                                    Subtasks ({{ task.completed_subtasks }}/{{ task.total_subtasks }})
+                                    <span class="details-toggle">▼</span>
+                                </summary>
+                                <div class="subtasks-content">
+                                    {% for subtask in task.subtasks %}
+                                    <div class="subtask-item">
+                                        <form method="POST" action="/complete_subtask" style="display:inline;">
+                                            <input type="hidden" name="task_id" value="{{ task.id }}">
+                                            <input type="hidden" name="subtask_id" value="{{ subtask.id }}">
+                                            <button type="submit" class="subtask-complete-btn" title="Toggle Complete">
+                                                {% if subtask.completed %}
+                                                <span class="subtask-number-badge completed">{{ subtask.priority }}</span>
+                                                {% else %}
+                                                <span class="subtask-number-badge">{{ subtask.priority }}</span>
+                                                {% endif %}
+                                            </button>
+                                        </form>
+                                        <details class="subtask-details-container">
+                                            <summary class="subtask-title {{ 'subtask-completed' if subtask.completed else '' }}">
+                                                {{ subtask.title }}
+                                            </summary>
+                                            {% if subtask.description %}
+                                            <div class="subtask-description">{{ format_text(subtask.description)|safe }}</div>
+                                            {% endif %}
+                                        </details>
+                                        <div class="subtask-actions">
+                                            <button class="edit-subtask-btn" onclick="openEditSubtaskModal('{{ task.id }}', '{{ subtask.id }}')" title="Edit Subtask">
+                                                <i class="fas fa-edit"></i>
+                                            </button>
+                                            <form method="POST" action="/delete_subtask" style="display:inline;">
+                                                <input type="hidden" name="task_id" value="{{ task.id }}">
+                                                <input type="hidden" name="subtask_id" value="{{ subtask.id }}">
+                                                <button type="submit" class="delete-subtask-btn" title="Delete Subtask">
+                                                    <i class="fas fa-trash"></i>
+                                                </button>
+                                            </form>
+                                        </div>
+                                    </div>
+                                    {% endfor %}
+                                </div>
+                            </details>
+                            {% endif %}
+                            
+                            <div class="task-meta">
+                                {% if task.repeat != 'none' %}
+                                <span class="repeat-badge">
+                                    <i class="fas fa-repeat"></i>
+                                    {% if task.repeat == 'daily' %}
+                                        Daily
+                                    {% elif task.repeat == 'weekly' %}
+                                        Weekly on {{ task.repeat_day or 'Sunday' }}
+                                    {% else %}
+                                        {{ task.repeat }}
+                                    {% endif %}
+                                </span>
+                                {% else %}
+                                <span class="repeat-badge">
+                                    <i class="fas fa-repeat"></i> None
+                                </span>
+                                {% endif %}
+                                
+                                <span class="priority-badge">P{{ task.priority }}</span>
+                                
+                                {% if task.notify_enabled %}
+                                <span class="notify-badge">
+                                    <i class="fas fa-bell"></i> Notify
+                                </span>
+                                {% endif %}
+                            </div>
                         </div>
-                    </div>
-                    {% endfor %}
+                        {% endfor %}
+                    {% endif %}
                 </div>
             </div>
-            
+
+            <!-- Notes View -->
+            <div class="view-content {{ 'active' if view == 'notes' else '' }}" id="notesView">
+                <div class="content-header">
+                    <h1 class="page-title">Notes</h1>
+                </div>
+                <div class="notes-container">
+                    {% if not processed_notes %}
+                    <div class="empty-state" style="grid-column: 1 / -1;">
+                        <i class="fas fa-wand-magic-sparkles"></i>
+                        <p>No notes yet. Add one to get started!</p>
+                    </div>
+                    {% else %}
+                        {% for note in processed_notes %}
+                        <div class="note-card">
+                            <details class="note-details">
+                                <summary class="note-summary">
+                                    <div class="note-header">
+                                        <h3 class="note-title">{{ note.title }}</h3>
+                                        <div class="note-date">Updated: {{ note.updated_display }}</div>
+                                    </div>
+                                </summary>
+                                <div class="note-content">
+                                    {% if note.description %}
+                                    <div class="note-description">{{ format_text(note.description)|safe }}</div>
+                                    {% endif %}
+                                    <div class="note-footer">
+                                        <div class="note-meta">
+                                            <span class="note-date-badge">Created: {{ note.created_display }}</span>
+                                            {% if note.notify_enabled %}
+                                            <span class="notify-badge">
+                                                <i class="fas fa-bell"></i> Every {{ note.notify_interval }}h
+                                            </span>
+                                            {% endif %}
+                                        </div>
+                                        <div class="note-actions">
+                                            <form method="POST" action="/move_note" style="display:inline;">
+                                                <input type="hidden" name="note_id" value="{{ note.id }}">
+                                                <input type="hidden" name="direction" value="down">
+                                                <button type="submit" class="note-move-btn" title="Move Down">
+                                                    <i class="fas fa-arrow-down"></i>
+                                                </button>
+                                            </form>
+                                            <form method="POST" action="/move_note" style="display:inline;">
+                                                <input type="hidden" name="note_id" value="{{ note.id }}">
+                                                <input type="hidden" name="direction" value="up">
+                                                <button type="submit" class="note-move-btn" title="Move Up" style="margin-left: 6px;">
+                                                    <i class="fas fa-arrow-up"></i>
+                                                </button>
+                                            </form>
+                                            <button class="note-action-btn" onclick="openEditNoteModal('{{ note.id }}')" title="Edit Note">
+                                                <i class="fas fa-edit"></i>
+                                            </button>
+                                            <form method="POST" action="/delete_note" style="display:inline;">
+                                                <input type="hidden" name="note_id" value="{{ note.id }}">
+                                                <button type="submit" class="note-action-btn delete" title="Delete Note">
+                                                    <i class="fas fa-trash"></i>
+                                                </button>
+                                            </form>
+                                        </div>
+                                    </div>
+                                </div>
+                            </details>
+                        </div>
+                        {% endfor %}
+                    {% endif %}
+                </div>
+            </div>
+
             <!-- History View -->
-            <div id="historyView" class="section {{ 'active' if view == 'history' }}">
-                <div style="font-size: 16px; font-weight: 600; margin-bottom: 15px; color: #333;">
-                    <i class="fas fa-history"></i> Task History
+            <div class="view-content {{ 'active' if view == 'history' else '' }}" id="historyView">
+                <div class="content-header">
+                    <h1 class="page-title">History</h1>
                 </div>
                 
-                {% if not history %}
-                <div style="text-align: center; padding: 40px 20px; color: #666;">
-                    <i class="fas fa-history" style="font-size: 48px; opacity: 0.5;"></i>
-                    <p>No completed tasks yet</p>
-                </div>
-                {% endif %}
-                
-                {% for item in history %}
-                {% set item_dict = row_to_dict(item) %}
-                {% if item_dict %}
-                <div style="background: white; border-radius: 12px; padding: 15px; margin-bottom: 10px; border-left: 4px solid var(--success);">
-                    <div style="font-weight: 600; margin-bottom: 5px;">
-                        {{ item_dict.task_title or item_dict.title }}
+                <div id="historyContainer">
+                    {% if not history_with_subtasks %}
+                    <div class="empty-state">
+                        <i class="fas fa-history"></i>
+                        <p>No completed items yet. Complete some items to see them here!</p>
                     </div>
-                    <div style="font-size: 12px; color: #666;">
-                        <i class="far fa-calendar-check"></i>
-                        {{ datetime.strptime(item_dict.completed_at, '%Y-%m-%d %H:%M:%S').strftime('%B %d, %I:%M %p') }} IST
-                    </div>
+                    {% else %}
+                        {% set grouped_history = {} %}
+                        {% for item in history_with_subtasks %}
+                            {% set date = item.completed_at[:10] %}
+                            {% set date_display = datetime.strptime(date, '%Y-%m-%d').strftime('%B %d, %Y') %}
+                            {% if date_display not in grouped_history %}
+                                {% set _ = grouped_history.update({date_display: []}) %}
+                            {% endif %}
+                            {% set _ = grouped_history[date_display].append(item) %}
+                        {% endfor %}
+                        
+                        {% for date_display, items in grouped_history.items()|sort(reverse=true) %}
+                        <div class="history-date-group">
+                            <details class="history-date-details">
+                                <summary class="history-date-summary">
+                                    <i class="fas fa-calendar"></i>{{ date_display }}
+                                    <span class="details-toggle">▼</span>
+                                </summary>
+                                <div class="history-date-content">
+                                    <div class="history-items-container">
+                                        {% for item in items %}
+                                        <div class="history-card">
+                                            <div class="history-card-header">
+                                                <div class="history-card-title">
+                                                    <i class="fas fa-tasks"></i>
+                                                    {{ item.title }}
+                                                </div>
+                                                <div class="history-card-time">
+                                                    {{ datetime.strptime(item.completed_at, '%Y-%m-%d %H:%M:%S').strftime('%I:%M %p') }}
+                                                </div>
+                                            </div>
+                                            {% if item.description %}
+                                            <div class="history-card-description">{{ format_text(item.description)|safe }}</div>
+                                            {% endif %}
+                                            <div class="history-card-meta">
+                                                {% if item.bucket %}
+                                                <span class="history-meta-item">Bucket: {{ item.bucket|title }}</span>
+                                                {% endif %}
+                                                {% if item.repeat %}
+                                                <span class="history-meta-item">Repeat: {{ 'No' if item.repeat == 'none' else item.repeat|title }}</span>
+                                                {% endif %}
+                                                {% if item.time_range %}
+                                                <span class="history-meta-item">Time: {{ item.time_range }}</span>
+                                                {% endif %}
+                                                {% if item.priority %}
+                                                <span class="history-meta-item">Priority: P{{ item.priority }}</span>
+                                                {% endif %}
+                                            </div>
+                                            {% if item.subtasks %}
+                                            <div class="history-subitems">
+                                                {% for subtask in item.subtasks %}
+                                                <div class="history-stage-item">
+                                                    <div class="history-stage-header">
+                                                        <span class="history-stage-title">{{ subtask.title }}</span>
+                                                    </div>
+                                                    {% if subtask.description %}
+                                                    <div class="history-stage-description">{{ format_text(subtask.description)|safe }}</div>
+                                                    {% endif %}
+                                                </div>
+                                                {% endfor %}
+                                            </div>
+                                            {% endif %}
+                                        </div>
+                                        {% endfor %}
+                                    </div>
+                                </div>
+                            </details>
+                        </div>
+                        {% endfor %}
+                    {% endif %}
                 </div>
-                {% endif %}
-                {% endfor %}
             </div>
             
             <!-- Settings View -->
-            <div id="settingsView" class="section {{ 'active' if view == 'settings' }}">
-                <div class="form-card">
-                    <div class="form-title">
-                        <i class="fas fa-bell"></i> Notifications
+            <div class="view-content {{ 'active' if view == 'settings' else '' }}" id="settingsView">
+                <div class="content-header">
+                    <h1 class="page-title">Settings</h1>
+                </div>
+                
+                <div class="settings-card">
+                    <h2 class="settings-title">
+                        <i class="fas fa-bell"></i>
+                        Notification Settings
+                    </h2>
+                    
+                    <div class="settings-item">
+                        <span class="settings-label">Hourly Task Status Reports</span>
+                        <form method="POST" id="hourlyReportForm" action="/toggle_setting">
+                            <input type="hidden" name="key" value="hourly_report">
+                            <label class="toggle-switch">
+                                <input type="checkbox" name="enabled" {{ 'checked' if settings.get('hourly_report') == '1' else '' }} onchange="this.form.submit()">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </form>
                     </div>
                     
-                    <div style="margin-bottom: 20px; padding: 12px; background: #f8f9fa; border-radius: 8px;">
-                        <div style="font-weight: 600; margin-bottom: 5px; color: var(--primary);">
-                            <i class="fas fa-info-circle"></i> Notification Schedule
-                        </div>
-                        <div style="font-size: 14px;">
-                            1 notification per minute for 10 minutes before each task starts
-                        </div>
+                    <p style="margin-top: 16px; color: var(--gray); font-size: 0.85rem;">
+                        <i class="fas fa-info-circle"></i> 
+                        Hourly reports send task status updates (completed/pending) to Telegram every hour.
+                    </p>
+                </div>
+                
+                <div class="settings-card">
+                    <h2 class="settings-title">
+                        <i class="fas fa-info-circle"></i>
+                        System Information
+                    </h2>
+                    
+                    <div class="settings-item">
+                        <span class="settings-label">Python Version</span>
+                        <span class="settings-value">{{ python_version }}</span>
                     </div>
                     
-                    <form method="POST" action="/toggle_setting">
-                        <input type="hidden" name="key" value="daily_summary">
-                        <div style="display: flex; justify-content: space-between; align-items: center; padding: 15px 0; border-bottom: 1px solid #eee;">
-                            <div>
-                                <div style="font-weight: 600; font-size: 15px;">Daily Summary</div>
-                                <div style="font-size: 12px; color: #666;">Send daily summary at 8:00 AM IST</div>
+                    <div class="settings-item">
+                        <span class="settings-label">Server Time (IST)</span>
+                        <span class="settings-value">{{ now.strftime('%Y-%m-%d %H:%M:%S') }}</span>
+                    </div>
+                    
+                    <div class="settings-item">
+                        <span class="settings-label">Total Tasks</span>
+                        <span class="settings-value">{{ all_tasks|length }}</span>
+                    </div>
+                    
+                    <div class="settings-item">
+                        <span class="settings-label">Total Notes</span>
+                        <span class="settings-value">{{ notes|length }}</span>
+                    </div>
+                </div>
+                
+                <div class="settings-card">
+                    <h2 class="settings-title">
+                        <i class="fas fa-robot"></i>
+                        Telegram Integration
+                    </h2>
+                    
+                    <div class="settings-item">
+                        <span class="settings-label">Notifications</span>
+                        <span class="settings-value">✅ Active</span>
+                    </div>
+                    
+                    <div class="settings-item">
+                        <span class="settings-label">Task Reminders</span>
+                        <span class="settings-value">10 messages before start</span>
+                    </div>
+                    
+                    <div class="settings-item">
+                        <span class="settings-label">Note Reminders</span>
+                        <span class="settings-value">Custom intervals</span>
+                    </div>
+                    
+                    <p style="margin-top: 16px; color: var(--gray); font-size: 0.85rem;">
+                        <i class="fas fa-key"></i> 
+                        Telegram User ID: {{ USER_ID }}
+                    </p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Modals -->
+        <div class="modal" id="addTaskModal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 class="modal-title">Add Task</h2>
+                    <button type="button" class="close-modal" onclick="closeAddTaskModal()">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <form method="POST" action="/add_task" id="addTaskForm">
+                        <div class="form-group">
+                            <label class="form-label">Title</label>
+                            <input type="text" class="form-input" name="title" required>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Description</label>
+                            <textarea class="form-textarea" name="description" placeholder="Optional details"></textarea>
+                            <small style="color: var(--gray); font-size: 0.75rem;">Use *text* for <strong>bold</strong> and _text_ for <em>italic</em></small>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Priority</label>
+                            <select class="form-select" name="priority">
+                                {% for i in range(1, 16) %}
+                                <option value="{{ i }}" {% if i==15 %}selected{% endif %}>{{ i }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div class="checkbox-group">
+                            <input type="checkbox" class="form-checkbox" name="notify_enabled" id="notifyEnabled" checked>
+                            <label class="checkbox-label" for="notifyEnabled">Enable Telegram notifications (10 reminders before start time)</label>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Repeat</label>
+                            <select class="form-select" name="repeat" id="repeatSelect">
+                                <option value="none">None</option>
+                                <option value="daily">Daily</option>
+                                <option value="weekly">Weekly</option>
+                            </select>
+                        </div>
+                        <div class="date-input-group">
+                            <div class="form-group">
+                                <label class="form-label">Start Date</label>
+                                <input type="date" class="form-input" name="start_date" id="startDate" value="{{ now.strftime('%Y-%m-%d') }}">
                             </div>
-                            <div style="position: relative; width: 50px; height: 24px;">
-                                <input type="checkbox" name="enabled" {{ 'checked' if settings.get('daily_summary') == '1' }} 
-                                       onchange="this.form.submit()" 
-                                       style="position: absolute; opacity: 0; width: 0; height: 0;">
-                                <span style="position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: {{ '#4cc9f0' if settings.get('daily_summary') == '1' else '#ccc' }}; border-radius: 24px; transition: .4s;"></span>
-                                <span style="position: absolute; content: ''; height: 16px; width: 16px; left: {{ '26px' if settings.get('daily_summary') == '1' else '4px' }}; bottom: 4px; background-color: white; border-radius: 50%; transition: .4s;"></span>
+                            <div class="form-group">
+                                <label class="form-label">End Date</label>
+                                <input type="date" class="form-input" name="end_date" id="endDate" value="{{ now.strftime('%Y-%m-%d') }}">
                             </div>
+                        </div>
+                        <div class="time-input-group">
+                            <div class="form-group">
+                                <label class="form-label">Start Time</label>
+                                <input type="time" class="form-input" name="start_time" id="startTime" value="{{ now.strftime('%H:%M') }}">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">End Time</label>
+                                <input type="time" class="form-input" name="end_time" id="endTime" value="{{ (now + timedelta(hours=1)).strftime('%H:%M') }}">
+                            </div>
+                        </div>
+                        <div class="form-group" id="repeatEndDateGroup">
+                            <label class="form-label">End of Repeat Date (Leave empty for infinite)</label>
+                            <input type="date" class="form-input" name="repeat_end_date" id="repeatEndDate">
+                        </div>
+                        <div class="form-actions">
+                            <button type="button" class="btn btn-secondary" onclick="closeAddTaskModal()">Cancel</button>
+                            <button type="submit" class="btn btn-primary">Add Task</button>
                         </div>
                     </form>
                 </div>
-                
-                <div class="form-card">
-                    <div class="form-title">
-                        <i class="fas fa-key"></i> Security
-                    </div>
-                    
-                    <form method="POST" action="/change_code">
+            </div>
+        </div>
+
+        <div class="modal" id="addNoteModal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 class="modal-title">Add Note</h2>
+                    <button type="button" class="close-modal" onclick="closeAddNoteModal()">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <form method="POST" action="/add_note">
                         <div class="form-group">
-                            <label class="form-label">New Access Code</label>
-                            <input type="password" class="form-input" name="new_code" placeholder="Enter new code" required>
+                            <label class="form-label">Title</label>
+                            <input type="text" class="form-input" name="title" required>
                         </div>
                         <div class="form-group">
-                            <label class="form-label">Confirm Code</label>
-                            <input type="password" class="form-input" name="confirm_code" placeholder="Confirm new code" required>
+                            <label class="form-label">Description</label>
+                            <textarea class="form-textarea" name="description" placeholder="Optional details"></textarea>
+                            <small style="color: var(--gray); font-size: 0.75rem;">Use *text* for <strong>bold</strong> and _text_ for <em>italic</em></small>
                         </div>
-                        <button type="submit" class="btn btn-primary">
-                            <i class="fas fa-save"></i> Change Access Code
-                        </button>
+                        <div class="checkbox-group">
+                            <input type="checkbox" class="form-checkbox" name="notify_enabled" id="noteNotifyEnabled">
+                            <label class="checkbox-label" for="noteNotifyEnabled">Enable regular Telegram notifications</label>
+                        </div>
+                        <div class="form-group" id="noteIntervalGroup" style="display: none;">
+                            <label class="form-label">Notification Interval (hours)</label>
+                            <input type="number" class="form-input" name="notify_interval" min="1" max="24" value="12" placeholder="Enter interval in hours">
+                        </div>
+                        <div class="form-actions">
+                            <button type="button" class="btn btn-secondary" onclick="closeAddNoteModal()">Cancel</button>
+                            <button type="submit" class="btn btn-primary">Save Note</button>
+                        </div>
                     </form>
                 </div>
-                
-                <div class="form-card">
-                    <div class="form-title">
-                        <i class="fab fa-telegram"></i> Telegram Bot
-                    </div>
-                    <div style="font-size: 14px; line-height: 1.5;">
-                        <div style="margin-bottom: 10px;">
-                            <strong>User ID:</strong> {{ USER_ID }}
-                        </div>
-                        <div style="margin-bottom: 10px;">
-                            <strong>Status:</strong> 
-                            <span style="color: var(--success);">✅ Connected</span>
-                        </div>
-                        <div style="font-size: 13px; color: #666;">
-                            Send /start to your bot to get commands
-                        </div>
-                    </div>
-                </div>
-                
-                <a href="/logout" style="display: block; background: var(--danger); color: white; padding: 14px; border-radius: 8px; text-align: center; text-decoration: none; margin-top: 20px; font-weight: 600;">
-                    <i class="fas fa-sign-out-alt"></i> Logout
-                </a>
             </div>
         </div>
         
-        <!-- FAB -->
-        <div class="fab" onclick="document.querySelector('#taskForm').scrollIntoView({behavior: 'smooth'})">
-            <i class="fas fa-plus"></i>
+        <div class="modal" id="editNoteModal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 class="modal-title">Edit Note</h2>
+                    <button type="button" class="close-modal" onclick="closeEditNoteModal()">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <form method="POST" action="/update_note" id="editNoteForm">
+                        <input type="hidden" name="note_id" id="editNoteId">
+                        <div class="form-group">
+                            <label class="form-label">Title</label>
+                            <input type="text" class="form-input" name="title" id="editNoteTitle" required>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Description</label>
+                            <textarea class="form-textarea" name="description" id="editNoteDescription"></textarea>
+                            <small style="color: var(--gray); font-size: 0.75rem;">Use *text* for <strong>bold</strong> and _text_ for <em>italic</em></small>
+                        </div>
+                        <div class="checkbox-group">
+                            <input type="checkbox" class="form-checkbox" name="notify_enabled" id="editNoteNotifyEnabled">
+                            <label class="checkbox-label" for="editNoteNotifyEnabled">Enable regular Telegram notifications</label>
+                        </div>
+                        <div class="form-group" id="editNoteIntervalGroup" style="display: none;">
+                            <label class="form-label">Notification Interval (hours)</label>
+                            <input type="number" class="form-input" name="notify_interval" id="editNoteInterval" min="1" max="24" value="12" placeholder="Enter interval in hours">
+                        </div>
+                        <div class="form-actions">
+                            <button type="button" class="btn btn-secondary" onclick="closeEditNoteModal()">Cancel</button>
+                            <button type="submit" class="btn btn-primary">Update Note</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
         </div>
-        
+
+        <div class="modal" id="addSubtaskModal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 class="modal-title">Add Subtask</h2>
+                    <button type="button" class="close-modal" onclick="closeAddSubtaskModal()">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <form method="POST" action="/add_subtask" id="addSubtaskForm">
+                        <input type="hidden" name="task_id" id="addSubtaskTaskId">
+                        <div class="form-group">
+                            <label class="form-label">Subtask Title</label>
+                            <input type="text" class="form-input" name="title" required>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Description</label>
+                            <textarea class="form-textarea" name="description" placeholder="Optional details"></textarea>
+                            <small style="color: var(--gray); font-size: 0.75rem;">Use *text* for <strong>bold</strong> and _text_ for <em>italic</em></small>
+                        </div>
+                        <div class="form-actions">
+                            <button type="button" class="btn btn-secondary" onclick="closeAddSubtaskModal()">Cancel</button>
+                            <button type="submit" class="btn btn-primary">Add Subtask</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <div class="modal" id="editTaskModal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 class="modal-title">Edit Task</h2>
+                    <button type="button" class="close-modal" onclick="closeEditTaskModal()">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <form method="POST" action="/update_task" id="editTaskForm">
+                        <input type="hidden" name="task_id" id="editTaskId">
+                        <div class="form-group">
+                            <label class="form-label">Title</label>
+                            <input type="text" class="form-input" name="title" id="editTaskTitle" required>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Description</label>
+                            <textarea class="form-textarea" name="description" id="editTaskDescription"></textarea>
+                            <small style="color: var(--gray); font-size: 0.75rem;">Use *text* for <strong>bold</strong> and _text_ for <em>italic</em></small>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Priority</label>
+                            <select class="form-select" name="priority" id="editTaskPriority">
+                                {% for i in range(1, 16) %}
+                                <option value="{{ i }}">{{ i }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div class="checkbox-group">
+                            <input type="checkbox" class="form-checkbox" name="notify_enabled" id="editTaskNotifyEnabled">
+                            <label class="checkbox-label" for="editTaskNotifyEnabled">Enable Telegram notifications (10 reminders before start time)</label>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Repeat</label>
+                            <select class="form-select" name="repeat" id="editTaskRepeat">
+                                <option value="none">None</option>
+                                <option value="daily">Daily</option>
+                                <option value="weekly">Weekly</option>
+                            </select>
+                        </div>
+                        <div class="date-input-group">
+                            <div class="form-group">
+                                <label class="form-label">Start Date</label>
+                                <input type="date" class="form-input" name="start_date" id="editTaskStartDate">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">End Date</label>
+                                <input type="date" class="form-input" name="end_date" id="editTaskEndDate">
+                            </div>
+                        </div>
+                        <div class="time-input-group">
+                            <div class="form-group">
+                                <label class="form-label">Start Time</label>
+                                <input type="time" class="form-input" name="start_time" id="editTaskStartTime">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">End Time</label>
+                                <input type="time" class="form-input" name="end_time" id="editTaskEndTime">
+                            </div>
+                        </div>
+                        <div class="form-group" id="editRepeatEndDateGroup">
+                            <label class="form-label">End of Repeat Date (Leave empty for infinite)</label>
+                            <input type="date" class="form-input" name="repeat_end_date" id="editRepeatEndDate">
+                        </div>
+                        <div class="form-actions">
+                            <button type="button" class="btn btn-secondary" onclick="closeEditTaskModal()">Cancel</button>
+                            <button type="submit" class="btn btn-primary">Update Task</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <div class="modal" id="editSubtaskModal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 class="modal-title">Edit Subtask</h2>
+                    <button type="button" class="close-modal" onclick="closeEditSubtaskModal()">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <form method="POST" action="/update_subtask" id="editSubtaskForm">
+                        <input type="hidden" name="task_id" id="editSubtaskTaskId">
+                        <input type="hidden" name="subtask_id" id="editSubtaskId">
+                        <div class="form-group">
+                            <label class="form-label">Subtask Title</label>
+                            <input type="text" class="form-input" name="title" id="editSubtaskTitle" required>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Subtask Description</label>
+                            <textarea class="form-textarea" name="description" id="editSubtaskDescription"></textarea>
+                            <small style="color: var(--gray); font-size: 0.75rem;">Use *text* for <strong>bold</strong> and _text_ for <em>italic</em></small>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Priority</label>
+                            <select class="form-select" name="priority" id="editSubtaskPriority">
+                                {% for i in range(1, 16) %}
+                                <option value="{{ i }}">{{ i }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div class="form-actions">
+                            <button type="button" class="btn btn-secondary" onclick="closeEditSubtaskModal()">Cancel</button>
+                            <button type="submit" class="btn btn-primary">Update Subtask</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+
         <script>
-            // Set default times
-            document.addEventListener('DOMContentLoaded', function() {
-                // Set start time to next hour in IST
+            function switchView(viewName) {
+                const url = new URL(window.location);
+                url.searchParams.set('view', viewName);
+                window.history.replaceState({}, '', url);
+                document.querySelectorAll('.view-content').forEach(view => view.classList.remove('active'));
+                document.getElementById(viewName + 'View').classList.add('active');
+                
+                // Update FAB based on view
+                updateFAB(viewName);
+            }
+            
+            function updateFAB(viewName) {
+                const fabContainer = document.getElementById('fabContainer');
+                if (fabContainer) {
+                    if (viewName === 'tasks') {
+                        fabContainer.innerHTML = '<button class="fab fab-tasks" onclick="openAddTaskModal()" title="Add Task"><i class="fas fa-plus"></i></button>';
+                    } else if (viewName === 'notes') {
+                        fabContainer.innerHTML = '<button class="fab fab-notes" onclick="openAddNoteModal()" title="Add Note"><i class="fas fa-plus"></i></button>';
+                    } else {
+                        fabContainer.innerHTML = '';
+                    }
+                }
+            }
+
+            function openModal(modalId) { 
+                document.getElementById(modalId).style.display = 'flex'; 
+                document.getElementById(modalId).scrollTop = 0;
+            }
+            function closeModal(modalId) { document.getElementById(modalId).style.display = 'none'; }
+
+            function openAddTaskModal() { 
+                // Set default time to next hour
                 const now = new Date();
-                const istOffset = 5.5 * 60 * 60 * 1000; // IST is UTC+5:30
-                const istTime = new Date(now.getTime() + istOffset);
+                const nextHour = new Date(now.getTime() + 60 * 60 * 1000);
                 
-                // Round to next hour
-                const nextHour = new Date(istTime);
-                nextHour.setHours(nextHour.getHours() + 1, 0, 0, 0);
+                document.getElementById('startTime').value = now.toTimeString().slice(0,5);
+                document.getElementById('endTime').value = nextHour.toTimeString().slice(0,5);
                 
-                const startTime = document.getElementById('startTime');
-                const endTime = document.getElementById('endTime');
-                
-                if (startTime && !startTime.value) {
-                    startTime.value = nextHour.toTimeString().slice(0,5);
+                openModal('addTaskModal'); 
+            }
+            
+            function closeAddTaskModal() { closeModal('addTaskModal'); }
+            function closeEditTaskModal() { closeModal('editTaskModal'); }
+            function closeEditSubtaskModal() { closeModal('editSubtaskModal'); }
+            
+            function openAddNoteModal() { 
+                openModal('addNoteModal'); 
+                // Show/hide interval input based on checkbox
+                const checkbox = document.getElementById('noteNotifyEnabled');
+                const intervalGroup = document.getElementById('noteIntervalGroup');
+                checkbox.addEventListener('change', function() {
+                    intervalGroup.style.display = this.checked ? 'block' : 'none';
+                });
+            }
+            
+            function closeAddNoteModal() { closeModal('addNoteModal'); }
+            function closeEditNoteModal() { closeModal('editNoteModal'); }
+            
+            function openAddSubtaskModal(taskId) {
+                document.getElementById('addSubtaskTaskId').value = taskId;
+                openModal('addSubtaskModal');
+            }
+            function closeAddSubtaskModal() { closeModal('addSubtaskModal'); }
+
+            async function openEditTaskModal(taskId) {
+                try {
+                    const response = await fetch(`/get_task/${taskId}`);
+                    const taskData = await response.json();
+                    
+                    if (taskData) {
+                        document.getElementById('editTaskId').value = taskId;
+                        document.getElementById('editTaskTitle').value = taskData.title || '';
+                        document.getElementById('editTaskDescription').value = taskData.description || '';
+                        document.getElementById('editTaskPriority').value = taskData.priority || 15;
+                        document.getElementById('editTaskRepeat').value = taskData.repeat || 'none';
+                        document.getElementById('editTaskNotifyEnabled').checked = taskData.notify_enabled || false;
+                        
+                        // Set date values
+                        const startDate = new Date(taskData.start_time);
+                        const endDate = new Date(taskData.end_time);
+                        document.getElementById('editTaskStartDate').value = startDate.toISOString().split('T')[0];
+                        document.getElementById('editTaskEndDate').value = endDate.toISOString().split('T')[0];
+                        
+                        // Set time values
+                        document.getElementById('editTaskStartTime').value = startDate.toTimeString().slice(0,5);
+                        document.getElementById('editTaskEndTime').value = endDate.toTimeString().slice(0,5);
+                        
+                        // Set repeat end date
+                        if (taskData.repeat_end_date) {
+                            const repeatEndDate = new Date(taskData.repeat_end_date);
+                            document.getElementById('editRepeatEndDate').value = repeatEndDate.toISOString().split('T')[0];
+                        } else {
+                            document.getElementById('editRepeatEndDate').value = '';
+                        }
+                        
+                        // Show/hide repeat end date
+                        const repeatSelect = document.getElementById('editTaskRepeat');
+                        const repeatEndDateGroup = document.getElementById('editRepeatEndDateGroup');
+                        if (repeatSelect.value === 'none') {
+                            repeatEndDateGroup.style.display = 'none';
+                        } else {
+                            repeatEndDateGroup.style.display = 'block';
+                        }
+                        
+                        openModal('editTaskModal');
+                    }
+                } catch (error) {
+                    console.error('Error loading task:', error);
+                    alert('Error loading task data');
+                }
+            }
+            
+            async function openEditNoteModal(noteId) {
+                try {
+                    const response = await fetch(`/get_note/${noteId}`);
+                    const noteData = await response.json();
+                    
+                    if (noteData) {
+                        document.getElementById('editNoteId').value = noteId;
+                        document.getElementById('editNoteTitle').value = noteData.title || '';
+                        document.getElementById('editNoteDescription').value = noteData.description || '';
+                        document.getElementById('editNoteNotifyEnabled').checked = noteData.notify_enabled || false;
+                        document.getElementById('editNoteInterval').value = noteData.notify_interval || 12;
+                        
+                        const intervalGroup = document.getElementById('editNoteIntervalGroup');
+                        intervalGroup.style.display = noteData.notify_enabled ? 'block' : 'none';
+                        
+                        openModal('editNoteModal');
+                        
+                        // Add change event for checkbox
+                        document.getElementById('editNoteNotifyEnabled').addEventListener('change', function() {
+                            intervalGroup.style.display = this.checked ? 'block' : 'none';
+                        });
+                    }
+                } catch (error) {
+                    console.error('Error loading note:', error);
+                    alert('Error loading note data');
+                }
+            }
+
+            async function openEditSubtaskModal(taskId, subtaskId) {
+                try {
+                    const response = await fetch(`/get_subtask/${taskId}/${subtaskId}`);
+                    const subtaskData = await response.json();
+                    
+                    if (subtaskData) {
+                        document.getElementById('editSubtaskTaskId').value = taskId;
+                        document.getElementById('editSubtaskId').value = subtaskId;
+                        document.getElementById('editSubtaskTitle').value = subtaskData.title || '';
+                        document.getElementById('editSubtaskDescription').value = subtaskData.description || '';
+                        document.getElementById('editSubtaskPriority').value = subtaskData.priority || 15;
+                        openModal('editSubtaskModal');
+                    }
+                } catch (error) {
+                    console.error('Error loading subtask:', error);
+                    alert('Error loading subtask data');
+                }
+            }
+
+            document.addEventListener('DOMContentLoaded', () => {
+                const urlParams = new URLSearchParams(window.location.search);
+                const viewParam = urlParams.get('view');
+                if (viewParam) {
+                    switchView(viewParam);
+                } else {
+                    // Initialize FAB for current view
+                    updateFAB('tasks');
                 }
                 
-                if (endTime && !endTime.value) {
-                    const start = new Date(`2000-01-01T${startTime.value}:00`);
-                    start.setHours(start.getHours() + 1);
-                    endTime.value = start.toTimeString().slice(0,5);
-                }
+                // Date validation for add task form
+                const startDateInput = document.getElementById('startDate');
+                const endDateInput = document.getElementById('endDate');
+                const startTimeInput = document.getElementById('startTime');
+                const endTimeInput = document.getElementById('endTime');
+                const repeatSelect = document.getElementById('repeatSelect');
+                const repeatEndDateGroup = document.getElementById('repeatEndDateGroup');
                 
-                // Update time display
-                function updateTime() {
-                    const timeElements = document.querySelectorAll('.time-display');
-                    const istTime = new Date(new Date().getTime() + (5.5 * 60 * 60 * 1000));
-                    const timeString = istTime.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-                    timeElements.forEach(el => {
-                        el.textContent = timeString + ' IST';
+                if (startDateInput && endDateInput) {
+                    startDateInput.addEventListener('change', function() {
+                        const startDate = new Date(this.value);
+                        const endDate = new Date(endDateInput.value);
+                        const maxEndDate = new Date(startDate);
+                        maxEndDate.setDate(maxEndDate.getDate() + 1);
+                        
+                        if (endDate > maxEndDate) {
+                            endDateInput.value = maxEndDate.toISOString().split('T')[0];
+                        }
+                        
+                        if (endDate < startDate) {
+                            endDateInput.value = this.value;
+                        }
+                    });
+                    
+                    endDateInput.addEventListener('change', function() {
+                        const startDate = new Date(startDateInput.value);
+                        const endDate = new Date(this.value);
+                        const maxEndDate = new Date(startDate);
+                        maxEndDate.setDate(maxEndDate.getDate() + 1);
+                        
+                        if (endDate > maxEndDate) {
+                            this.value = maxEndDate.toISOString().split('T')[0];
+                        }
+                        
+                        if (endDate < startDate) {
+                            this.value = startDateInput.value;
+                        }
                     });
                 }
                 
-                updateTime();
-                setInterval(updateTime, 60000);
+                // Time validation
+                if (startTimeInput && endTimeInput) {
+                    startTimeInput.addEventListener('change', function() {
+                        const startTime = this.value;
+                        const endTime = endTimeInput.value;
+                        
+                        if (startDateInput.value === endDateInput.value && startTime >= endTime) {
+                            const start = new Date(`2000-01-01T${startTime}`);
+                            start.setHours(start.getHours() + 1);
+                            endTimeInput.value = start.toTimeString().slice(0,5);
+                        }
+                    });
+                    
+                    endTimeInput.addEventListener('change', function() {
+                        const startTime = startTimeInput.value;
+                        const endTime = this.value;
+                        
+                        if (startDateInput.value === endDateInput.value && endTime <= startTime) {
+                            const end = new Date(`2000-01-01T${endTime}`);
+                            if (end.getHours() === 0) {
+                                startTimeInput.value = '23:00';
+                            } else {
+                                const start = new Date(`2000-01-01T${endTime}`);
+                                start.setHours(start.getHours() - 1);
+                                startTimeInput.value = start.toTimeString().slice(0,5);
+                            }
+                        }
+                    });
+                }
+                
+                // Show/hide repeat end date based on repeat selection
+                if (repeatSelect && repeatEndDateGroup) {
+                    repeatSelect.addEventListener('change', function() {
+                        if (this.value === 'none') {
+                            repeatEndDateGroup.style.display = 'none';
+                        } else {
+                            repeatEndDateGroup.style.display = 'block';
+                        }
+                    });
+                    
+                    // Initial state
+                    if (repeatSelect.value === 'none') {
+                        repeatEndDateGroup.style.display = 'none';
+                    }
+                }
+                
+                // Handle note notification checkbox
+                const noteNotifyCheckbox = document.getElementById('noteNotifyEnabled');
+                const noteIntervalGroup = document.getElementById('noteIntervalGroup');
+                
+                if (noteNotifyCheckbox && noteIntervalGroup) {
+                    noteNotifyCheckbox.addEventListener('change', function() {
+                        noteIntervalGroup.style.display = this.checked ? 'block' : 'none';
+                    });
+                }
             });
             
-            function switchView(view) {
-                window.location.href = '/?view=' + view;
+            // Update time badges every minute
+            function updateTimeBadges() {
+                const now = new Date();
+                const currentMinutes = now.getHours() * 60 + now.getMinutes();
+                
+                document.querySelectorAll('.time-remaining-badge').forEach(badge => {
+                    // This is a simplified version - you would need to store
+                    // the actual start/end times in data attributes for accurate calculation
+                    badge.textContent = badge.className.includes('active') ? 'Active' : 
+                                      badge.className.includes('upcoming') ? 'Upcoming' :
+                                      badge.className.includes('starting_soon') ? 'Starting Soon' :
+                                      badge.className.includes('due') ? 'Due' :
+                                      badge.className.includes('overdue') ? 'Overdue' : 'Completed';
+                });
             }
+            
+            // Update every minute
+            setInterval(updateTimeBadges, 60000);
         </script>
     </body>
     </html>
-    ''', 
-    tasks=processed_tasks, 
-    history=history, 
-    settings=settings, 
-    view=view, 
+    ''',
+    tasks=processed_tasks,
+    history_with_subtasks=history_with_subtasks,
+    processed_notes=processed_notes,
+    settings=settings,
+    view=view,
     datetime=datetime,
     now=now,
     USER_ID=USER_ID,
     completed_today=completed_today,
     pending_today=pending_today,
-    row_to_dict=row_to_dict)
+    all_tasks=all_tasks,
+    notes=notes,
+    format_text=format_text,
+    python_version='3.x',
+    timedelta=timedelta)
 
 # ============= ACTION ROUTES =============
-@app.route('/login', methods=['POST'])
-def login():
-    """Handle login"""
-    code = request.form.get('code', '')
-    
-    setting = db_query("SELECT value FROM settings WHERE key = 'access_code'", fetch_one=True)
-    setting_dict = row_to_dict(setting)
-    correct_code = setting_dict['value'] if setting_dict else ADMIN_CODE
-    
-    if code == correct_code:
-        resp = Response('', status=302)
-        resp.headers['Location'] = '/'
-        resp.set_cookie('logged_in', 'true', max_age=86400*30, httponly=True)
-        return resp
-    
-    return Response('', status=302, headers={'Location': '/?error=Invalid+access+code'})
-
-@app.route('/logout')
-def logout():
-    """Handle logout"""
-    resp = Response('', status=302)
-    resp.headers['Location'] = '/'
-    resp.set_cookie('logged_in', '', expires=0)
-    return resp
-
 @app.route('/add_task', methods=['POST'])
 def add_task():
     """Add a new task"""
-    if request.cookies.get('logged_in') != 'true':
-        return Response('Unauthorized', status=302, headers={'Location': '/'})
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
     
     title = request.form.get('title', '').strip()
-    start_time_str = request.form.get('start_time', '')
-    end_time_str = request.form.get('end_time', '')
+    description = request.form.get('description', '').strip()
+    priority = int(request.form.get('priority', 15))
     notify_enabled = 1 if request.form.get('notify_enabled') == 'on' else 0
+    repeat = request.form.get('repeat', 'none')
+    repeat_day = request.form.get('repeat_day')
+    repeat_end_date = request.form.get('repeat_end_date')
     
-    if not title or not start_time_str or not end_time_str:
-        return Response('Missing required fields', status=302, headers={'Location': '/?view=tasks'})
+    start_date = request.form.get('start_date')
+    start_time = request.form.get('start_time')
+    end_date = request.form.get('end_date')
+    end_time = request.form.get('end_time')
+    
+    if not title or not start_date or not start_time:
+        return redirect(url_for('index', view='tasks'))
     
     # Create datetime in IST
-    today = get_ist_time().strftime('%Y-%m-%d')
-    start_dt = parse_ist_time(start_time_str, today)
-    end_dt = parse_ist_time(end_time_str, today)
+    start_dt = parse_ist_time(start_time, start_date)
+    end_dt = parse_ist_time(end_time, end_date)
     
     start_datetime = start_dt.strftime('%Y-%m-%d %H:%M:%S')
     end_datetime = end_dt.strftime('%Y-%m-%d %H:%M:%S')
     
     # Insert task
     task_id = db_query(
-        "INSERT INTO tasks (title, start_time, end_time, notify_enabled) VALUES (?, ?, ?, ?)",
-        (title, start_datetime, end_datetime, notify_enabled)
+        """INSERT INTO tasks (title, description, start_time, end_time, notify_enabled, 
+           priority, repeat, repeat_day, repeat_end_date, next_occurrence) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (title, description, start_datetime, end_datetime, notify_enabled, 
+         priority, repeat, repeat_day, repeat_end_date, 
+         start_datetime if repeat != 'none' else None)
     )
     
-    # Send immediate notification if task starts soon
-    now = get_ist_time()
-    minutes_until = int((start_dt - now).total_seconds() / 60)
+    # Send notification if enabled and starting soon
+    if notify_enabled:
+        now = get_ist_time()
+        minutes_until = int((start_dt - now).total_seconds() / 60)
+        
+        if 1 <= minutes_until <= 10:
+            message = f"✅ <b>Task Added</b>\n"
+            message += f"📝 {title}\n"
+            message += f"🕐 Starts in {minutes_until} minute"
+            if minutes_until > 1:
+                message += "s"
+            message += f"\n📅 {start_dt.strftime('%I:%M %p')} IST"
+            send_telegram_message(message)
     
-    if 1 <= minutes_until <= 10:
-        message = f"✅ <b>Task Added</b>\n"
-        message += f"📝 {title}\n"
-        message += f"🕐 Starts in {minutes_until} minute"
-        if minutes_until > 1:
-            message += "s"
-        message += f"\n📅 {start_dt.strftime('%I:%M %p')} IST"
-        send_telegram_message(message)
+    return redirect(url_for('index', view='tasks'))
+
+@app.route('/add_subtask', methods=['POST'])
+def add_subtask():
+    """Add a subtask"""
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
     
-    return Response('', status=302, headers={'Location': '/?view=tasks'})
+    task_id = request.form.get('task_id')
+    title = request.form.get('title', '').strip()
+    description = request.form.get('description', '').strip()
+    
+    if task_id and title:
+        # Get current max priority for this task's subtasks
+        subtasks = db_query(
+            'SELECT priority FROM subtasks WHERE task_id = ? ORDER BY priority DESC LIMIT 1',
+            (task_id,), fetch_one=True
+        )
+        
+        priority = 1
+        if subtasks and subtasks['priority']:
+            priority = subtasks['priority'] + 1
+        
+        db_query(
+            "INSERT INTO subtasks (task_id, title, description, priority) VALUES (?, ?, ?, ?)",
+            (task_id, title, description, priority)
+        )
+    
+    return redirect(url_for('index', view='tasks'))
 
 @app.route('/complete_task', methods=['POST'])
 def complete_task():
     """Mark task as completed"""
-    if request.cookies.get('logged_in') != 'true':
-        return Response('Unauthorized', status=302, headers={'Location': '/'})
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
     
     task_id = request.form.get('task_id')
     
     if task_id:
-        task_row = db_query("SELECT * FROM tasks WHERE id = ?", (task_id,), fetch_one=True)
-        task = row_to_dict(task_row)
+        task = db_query("SELECT * FROM tasks WHERE id = ?", (task_id,), fetch_one=True)
         
         if task and not task['completed']:
+            # Mark task as completed
             db_query("UPDATE tasks SET completed = 1 WHERE id = ?", (task_id,))
             
-            db_query(
-                "INSERT INTO history (task_id, title) VALUES (?, ?)",
-                (task_id, task['title'])
+            # Get task time range for history
+            start_dt = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
+            start_dt = IST.localize(start_dt)
+            end_dt = datetime.strptime(task['end_time'], '%Y-%m-%d %H:%M:%S')
+            end_dt = IST.localize(end_dt)
+            time_range = f"{start_dt.strftime('%I:%M %p')} - {end_dt.strftime('%I:%M %p')}"
+            
+            # Add to history
+            history_id = db_query(
+                """INSERT INTO history (task_id, title, description, type, bucket, 
+                   repeat, time_range, priority) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (task_id, task['title'], task['description'], 'task', task['bucket'], 
+                 task['repeat'], time_range, task['priority'])
             )
             
+            # Add completed subtasks to history
+            subtasks = db_query(
+                "SELECT * FROM subtasks WHERE task_id = ? AND completed = 1",
+                (task_id,), fetch_all=True
+            )
+            
+            for subtask in subtasks:
+                db_query(
+                    """INSERT INTO history_subtasks (history_id, title, description, priority) 
+                       VALUES (?, ?, ?, ?)""",
+                    (history_id, subtask['title'], subtask['description'], subtask['priority'])
+                )
+            
+            # Send notification
             now = get_ist_time()
             message = f"🎉 <b>Task Completed!</b>\n"
             message += f"✅ {task['title']}\n"
             message += f"⏰ {now.strftime('%I:%M %p')} IST"
             send_telegram_message(message)
     
-    return Response('', status=302, headers={'Location': '/?view=tasks'})
+    return redirect(url_for('index', view='tasks'))
+
+@app.route('/complete_subtask', methods=['POST'])
+def complete_subtask():
+    """Toggle subtask completion"""
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
+    
+    task_id = request.form.get('task_id')
+    subtask_id = request.form.get('subtask_id')
+    
+    if task_id and subtask_id:
+        # Get current completion status
+        subtask = db_query(
+            "SELECT * FROM subtasks WHERE id = ?",
+            (subtask_id,), fetch_one=True
+        )
+        
+        if subtask:
+            new_status = 0 if subtask['completed'] else 1
+            db_query(
+                "UPDATE subtasks SET completed = ? WHERE id = ?",
+                (new_status, subtask_id)
+            )
+            
+            # Send notification if completed
+            if new_status == 1:
+                task = db_query(
+                    "SELECT title FROM tasks WHERE id = ?",
+                    (task_id,), fetch_one=True
+                )
+                
+                message = f"✅ <b>Subtask Completed</b>\n"
+                message += f"📝 {subtask['title']}\n"
+                if task:
+                    message += f"📋 Parent Task: {task['title']}\n"
+                message += f"⏰ Time: {get_ist_time().strftime('%I:%M %p')}"
+                send_telegram_message(message)
+    
+    return redirect(url_for('index', view='tasks'))
 
 @app.route('/delete_task', methods=['POST'])
 def delete_task():
     """Delete a task"""
-    if request.cookies.get('logged_in') != 'true':
-        return Response('Unauthorized', status=302, headers={'Location': '/'})
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
     
     task_id = request.form.get('task_id')
     
     if task_id:
         db_query("DELETE FROM tasks WHERE id = ?", (task_id,))
     
-    return Response('', status=302, headers={'Location': '/?view=tasks'})
+    return redirect(url_for('index', view='tasks'))
+
+@app.route('/delete_subtask', methods=['POST'])
+def delete_subtask():
+    """Delete a subtask"""
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
+    
+    task_id = request.form.get('task_id')
+    subtask_id = request.form.get('subtask_id')
+    
+    if subtask_id:
+        db_query("DELETE FROM subtasks WHERE id = ?", (subtask_id,))
+    
+    return redirect(url_for('index', view='tasks'))
+
+@app.route('/add_note', methods=['POST'])
+def add_note():
+    """Add a new note"""
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
+    
+    title = request.form.get('title', '').strip()
+    description = request.form.get('description', '').strip()
+    notify_enabled = 1 if request.form.get('notify_enabled') == 'on' else 0
+    notify_interval = int(request.form.get('notify_interval', 12))
+    
+    if title:
+        # Get max priority
+        notes = db_query(
+            "SELECT priority FROM notes ORDER BY priority DESC LIMIT 1",
+            fetch_one=True
+        )
+        
+        priority = 1
+        if notes and notes['priority']:
+            priority = notes['priority'] + 1
+        
+        db_query(
+            """INSERT INTO notes (title, description, priority, notify_enabled, notify_interval) 
+               VALUES (?, ?, ?, ?, ?)""",
+            (title, description, priority, notify_enabled, notify_interval)
+        )
+        
+        # Send notification if enabled
+        if notify_enabled and notify_interval > 0:
+            message = f"📝 <b>New Note Added</b>\n"
+            message += f"📌 <b>{title}</b>\n"
+            message += f"🔄 Interval: Every {notify_interval} hours\n"
+            message += f"🔔 You'll receive regular reminders"
+            send_telegram_message(message)
+    
+    return redirect(url_for('index', view='notes'))
+
+@app.route('/update_note', methods=['POST'])
+def update_note():
+    """Update a note"""
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
+    
+    note_id = request.form.get('note_id')
+    title = request.form.get('title', '').strip()
+    description = request.form.get('description', '').strip()
+    notify_enabled = 1 if request.form.get('notify_enabled') == 'on' else 0
+    notify_interval = int(request.form.get('notify_interval', 12))
+    
+    if note_id and title:
+        db_query(
+            """UPDATE notes SET title = ?, description = ?, notify_enabled = ?, 
+               notify_interval = ?, updated_at = CURRENT_TIMESTAMP 
+               WHERE id = ?""",
+            (title, description, notify_enabled, notify_interval, note_id)
+        )
+    
+    return redirect(url_for('index', view='notes'))
+
+@app.route('/delete_note', methods=['POST'])
+def delete_note():
+    """Delete a note"""
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
+    
+    note_id = request.form.get('note_id')
+    
+    if note_id:
+        db_query("DELETE FROM notes WHERE id = ?", (note_id,))
+    
+    return redirect(url_for('index', view='notes'))
+
+@app.route('/move_note', methods=['POST'])
+def move_note():
+    """Move note up or down"""
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
+    
+    note_id = request.form.get('note_id')
+    direction = request.form.get('direction')
+    
+    if note_id and direction:
+        # Get current note
+        note = db_query(
+            "SELECT id, priority FROM notes WHERE id = ?",
+            (note_id,), fetch_one=True
+        )
+        
+        if note:
+            current_priority = note['priority']
+            
+            if direction == 'up':
+                # Get note above
+                above_note = db_query(
+                    "SELECT id, priority FROM notes WHERE priority < ? ORDER BY priority DESC LIMIT 1",
+                    (current_priority,), fetch_one=True
+                )
+                
+                if above_note:
+                    # Swap priorities
+                    db_query("UPDATE notes SET priority = ? WHERE id = ?", 
+                            (above_note['priority'], note_id))
+                    db_query("UPDATE notes SET priority = ? WHERE id = ?", 
+                            (current_priority, above_note['id']))
+            
+            elif direction == 'down':
+                # Get note below
+                below_note = db_query(
+                    "SELECT id, priority FROM notes WHERE priority > ? ORDER BY priority ASC LIMIT 1",
+                    (current_priority,), fetch_one=True
+                )
+                
+                if below_note:
+                    # Swap priorities
+                    db_query("UPDATE notes SET priority = ? WHERE id = ?", 
+                            (below_note['priority'], note_id))
+                    db_query("UPDATE notes SET priority = ? WHERE id = ?", 
+                            (current_priority, below_note['id']))
+    
+    return redirect(url_for('index', view='notes'))
+
+@app.route('/update_task', methods=['POST'])
+def update_task():
+    """Update a task"""
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
+    
+    task_id = request.form.get('task_id')
+    title = request.form.get('title', '').strip()
+    description = request.form.get('description', '').strip()
+    priority = int(request.form.get('priority', 15))
+    notify_enabled = 1 if request.form.get('notify_enabled') == 'on' else 0
+    repeat = request.form.get('repeat', 'none')
+    repeat_day = request.form.get('repeat_day')
+    repeat_end_date = request.form.get('repeat_end_date')
+    
+    start_date = request.form.get('start_date')
+    start_time = request.form.get('start_time')
+    end_date = request.form.get('end_date')
+    end_time = request.form.get('end_time')
+    
+    if task_id and title and start_date and start_time:
+        # Create datetime in IST
+        start_dt = parse_ist_time(start_time, start_date)
+        end_dt = parse_ist_time(end_time, end_date)
+        
+        start_datetime = start_dt.strftime('%Y-%m-%d %H:%M:%S')
+        end_datetime = end_dt.strftime('%Y-%m-%d %H:%M:%S')
+        
+        db_query(
+            """UPDATE tasks SET title = ?, description = ?, start_time = ?, end_time = ?, 
+               notify_enabled = ?, priority = ?, repeat = ?, repeat_day = ?, repeat_end_date = ?,
+               next_occurrence = ? 
+               WHERE id = ?""",
+            (title, description, start_datetime, end_datetime, notify_enabled, 
+             priority, repeat, repeat_day, repeat_end_date,
+             start_datetime if repeat != 'none' else None, task_id)
+        )
+    
+    return redirect(url_for('index', view='tasks'))
+
+@app.route('/update_subtask', methods=['POST'])
+def update_subtask():
+    """Update a subtask"""
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
+    
+    task_id = request.form.get('task_id')
+    subtask_id = request.form.get('subtask_id')
+    title = request.form.get('title', '').strip()
+    description = request.form.get('description', '').strip()
+    priority = int(request.form.get('priority', 15))
+    
+    if subtask_id and title:
+        db_query(
+            "UPDATE subtasks SET title = ?, description = ?, priority = ? WHERE id = ?",
+            (title, description, priority, subtask_id)
+        )
+    
+    return redirect(url_for('index', view='tasks'))
 
 @app.route('/toggle_setting', methods=['POST'])
 def toggle_setting():
     """Toggle a setting"""
-    if request.cookies.get('logged_in') != 'true':
-        return Response('Unauthorized', status=302, headers={'Location': '/'})
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
     
     key = request.form.get('key')
-    enabled = '1' if request.form.get('enabled') == 'on' else '0'
+    enabled = request.form.get('enabled')
     
-    if key:
-        db_query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, enabled))
+    if key and enabled is not None:
+        value = '1' if enabled == 'on' else '0'
+        db_query(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, value)
+        )
+        
+        # Send confirmation
+        if key == 'hourly_report':
+            if value == '1':
+                message = "📊 <b>Hourly Reports Enabled</b>\n"
+                message += "You'll receive task status reports every hour"
+            else:
+                message = "📊 <b>Hourly Reports Disabled</b>\n"
+                message += "Hourly task reports have been turned off"
+            send_telegram_message(message)
     
-    return Response('', status=302, headers={'Location': '/?view=settings'})
+    return redirect(url_for('index', view='settings'))
 
-@app.route('/change_code', methods=['POST'])
-def change_code():
-    """Change access code"""
-    if request.cookies.get('logged_in') != 'true':
-        return Response('Unauthorized', status=302, headers={'Location': '/'})
+# ============= API ENDPOINTS =============
+@app.route('/get_task/<int:task_id>')
+def get_task(task_id):
+    """Get task data for editing"""
+    if not session.get('logged_in'):
+        return jsonify({'error': 'Unauthorized'}), 401
     
-    new_code = request.form.get('new_code', '')
-    confirm_code = request.form.get('confirm_code', '')
+    task = db_query("SELECT * FROM tasks WHERE id = ?", (task_id,), fetch_one=True)
+    if task:
+        return jsonify(row_to_dict(task))
+    return jsonify({'error': 'Task not found'}), 404
+
+@app.route('/get_note/<int:note_id>')
+def get_note(note_id):
+    """Get note data for editing"""
+    if not session.get('logged_in'):
+        return jsonify({'error': 'Unauthorized'}), 401
     
-    if new_code and new_code == confirm_code:
-        db_query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", ('access_code', new_code))
+    note = db_query("SELECT * FROM notes WHERE id = ?", (note_id,), fetch_one=True)
+    if note:
+        return jsonify(row_to_dict(note))
+    return jsonify({'error': 'Note not found'}), 404
+
+@app.route('/get_subtask/<int:task_id>/<int:subtask_id>')
+def get_subtask(task_id, subtask_id):
+    """Get subtask data for editing"""
+    if not session.get('logged_in'):
+        return jsonify({'error': 'Unauthorized'}), 401
     
-    return Response('', status=302, headers={'Location': '/?view=settings'})
+    subtask = db_query(
+        "SELECT * FROM subtasks WHERE id = ? AND task_id = ?",
+        (subtask_id, task_id), fetch_one=True
+    )
+    if subtask:
+        return jsonify(row_to_dict(subtask))
+    return jsonify({'error': 'Subtask not found'}), 404
 
 # ============= START APPLICATION =============
 def start_bot_polling():

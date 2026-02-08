@@ -1,0 +1,17 @@
+# .koyebignore
+# Ignore JSON files to prevent redeploy on data changes
+*.json
+
+# Or specifically ignore your data files:
+tasks.json
+history.json
+notes.json
+settings.json
+data.json
+data_backup.json
+
+# Keep your main Python files
+!main.py
+!demo.py
+!requirements.txt
+!Procfile

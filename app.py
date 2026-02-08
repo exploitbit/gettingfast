@@ -1,4 +1,3 @@
-
 """
 Simple Task Tracker with GitHub Storage
 Koyeb-compatible version
@@ -9,7 +8,7 @@ import json
 import threading
 from datetime import datetime
 import pytz
-from flask import Flask, request, render_template_string, jsonify
+from flask import Flask, request, render_template_string, jsonify, Response
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import requests
@@ -322,75 +321,6 @@ def download_data_command(message):
             parse_mode='HTML'
         )
 
-@bot.message_handler(commands=['clear'])
-def clear_data_command(message):
-    """Clear all data"""
-    if str(message.chat.id) != USER_ID:
-        return
-    
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(
-        InlineKeyboardButton("✅ Yes, clear all", callback_data='confirm_clear'),
-        InlineKeyboardButton("❌ Cancel", callback_data='cancel_clear')
-    )
-    
-    bot.reply_to(message, "⚠️ <b>Warning!</b>\n\nThis will delete ALL data from GitHub repository.\nAre you sure?", parse_mode='HTML', reply_markup=keyboard)
-
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callback(call):
-    """Handle callback queries"""
-    chat_id = call.message.chat.id
-    
-    if str(chat_id) != USER_ID:
-        return
-    
-    if call.data == 'add_task':
-        bot.send_message(chat_id, "📝 <b>Send me your task:</b>\n\nJust type and send your message.", parse_mode='HTML')
-    
-    elif call.data == 'view_tasks':
-        show_tasks(call.message)
-    
-    elif call.data == 'download_data':
-        download_data_command(call.message)
-    
-    elif call.data == 'refresh':
-        data = load_data()
-        if data["tasks"]:
-            last_task = data["tasks"][-1]
-            last_text = last_task['text'][:50] + '...' if len(last_task['text']) > 50 else last_task['text']
-        else:
-            last_text = 'None'
-            
-        bot.edit_message_text(
-            f"🔄 <b>Refreshed!</b>\n\nTotal tasks: {len(data['tasks'])}\nLast task: {last_text}",
-            chat_id,
-            call.message.message_id,
-            parse_mode='HTML'
-        )
-    
-    elif call.data == 'clear_data':
-        clear_data_command(call.message)
-    
-    elif call.data == 'confirm_clear':
-        # Clear data
-        empty_data = {
-            "tasks": [],
-            "messages": [],
-            "notes": [],
-            "last_id": 0
-        }
-        success = save_data(empty_data)
-        
-        if success:
-            bot.edit_message_text("🗑️ <b>All data cleared from GitHub!</b>", chat_id, call.message.message_id, parse_mode='HTML')
-        else:
-            bot.edit_message_text("⚠️ <b>Failed to clear from GitHub</b>\n\nLocal data cleared only.", chat_id, call.message.message_id, parse_mode='HTML')
-    
-    elif call.data == 'cancel_clear':
-        bot.edit_message_text("✅ <b>Cancelled</b>\n\nYour data is safe.", chat_id, call.message.message_id, parse_mode='HTML')
-    
-    bot.answer_callback_query(call.id)
-
 # ============= FLASK WEB APP =============
 @app.route('/')
 def index():
@@ -398,356 +328,6 @@ def index():
     try:
         data = load_data()
         now = get_ist_time()
-        
-        html = '''
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>GitHub Task Tracker</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <style>
-                * {
-                    margin: 0;
-                    padding: 0;
-                    box-sizing: border-box;
-                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                }
-                
-                body {
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    min-height: 100vh;
-                    padding: 20px;
-                }
-                
-                .container {
-                    max-width: 800px;
-                    margin: 0 auto;
-                    background: white;
-                    border-radius: 15px;
-                    box-shadow: 0 10px 30px rgba(0,0,0,0.2);
-                    overflow: hidden;
-                }
-                
-                .header {
-                    background: linear-gradient(135deg, #24292e 0%, #0366d6 100%);
-                    color: white;
-                    padding: 25px;
-                    text-align: center;
-                }
-                
-                .header h1 {
-                    font-size: 2.2rem;
-                    margin-bottom: 10px;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    gap: 10px;
-                }
-                
-                .header p {
-                    opacity: 0.9;
-                    font-size: 1rem;
-                }
-                
-                .github-badge {
-                    display: inline-block;
-                    background: rgba(255,255,255,0.1);
-                    padding: 5px 10px;
-                    border-radius: 20px;
-                    font-size: 0.8rem;
-                    margin-top: 5px;
-                }
-                
-                .stats {
-                    display: grid;
-                    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-                    gap: 15px;
-                    padding: 20px;
-                    background: #f8f9fa;
-                }
-                
-                .stat-card {
-                    background: white;
-                    padding: 20px;
-                    border-radius: 10px;
-                    text-align: center;
-                    box-shadow: 0 3px 10px rgba(0,0,0,0.1);
-                }
-                
-                .stat-number {
-                    font-size: 2rem;
-                    font-weight: bold;
-                    color: #0366d6;
-                    margin-bottom: 5px;
-                }
-                
-                .stat-label {
-                    color: #666;
-                    font-size: 0.9rem;
-                }
-                
-                .content {
-                    padding: 30px;
-                }
-                
-                .section {
-                    margin-bottom: 30px;
-                }
-                
-                .section-title {
-                    font-size: 1.3rem;
-                    color: #333;
-                    margin-bottom: 15px;
-                    padding-bottom: 10px;
-                    border-bottom: 2px solid #0366d6;
-                    display: flex;
-                    align-items: center;
-                    gap: 10px;
-                }
-                
-                .section-title i {
-                    color: #0366d6;
-                }
-                
-                .task-list {
-                    display: flex;
-                    flex-direction: column;
-                    gap: 15px;
-                }
-                
-                .task-card {
-                    background: #f8f9fa;
-                    border-radius: 10px;
-                    padding: 20px;
-                    border-left: 4px solid #0366d6;
-                    transition: transform 0.3s, box-shadow 0.3s;
-                }
-                
-                .task-card:hover {
-                    transform: translateY(-3px);
-                    box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-                }
-                
-                .task-text {
-                    font-size: 1.1rem;
-                    color: #333;
-                    margin-bottom: 10px;
-                    line-height: 1.4;
-                }
-                
-                .task-meta {
-                    display: flex;
-                    justify-content: space-between;
-                    font-size: 0.85rem;
-                    color: #666;
-                }
-                
-                .empty-state {
-                    text-align: center;
-                    padding: 40px 20px;
-                    color: #666;
-                }
-                
-                .empty-state i {
-                    font-size: 3rem;
-                    margin-bottom: 15px;
-                    opacity: 0.3;
-                }
-                
-                .empty-state p {
-                    font-size: 1.1rem;
-                    margin-bottom: 20px;
-                }
-                
-                .btn {
-                    display: inline-block;
-                    background: #0366d6;
-                    color: white;
-                    padding: 12px 25px;
-                    border-radius: 8px;
-                    text-decoration: none;
-                    font-weight: 600;
-                    transition: background 0.3s;
-                    border: none;
-                    cursor: pointer;
-                    font-size: 1rem;
-                }
-                
-                .btn:hover {
-                    background: #005cc5;
-                }
-                
-                .btn-download {
-                    background: #28a745;
-                }
-                
-                .btn-download:hover {
-                    background: #218838;
-                }
-                
-                .btn-clear {
-                    background: #dc3545;
-                }
-                
-                .btn-clear:hover {
-                    background: #c82333;
-                }
-                
-                .btn-telegram {
-                    background: #0088cc;
-                }
-                
-                .btn-telegram:hover {
-                    background: #0077b5;
-                }
-                
-                .actions {
-                    display: flex;
-                    gap: 15px;
-                    margin-top: 20px;
-                    flex-wrap: wrap;
-                }
-                
-                .info-box {
-                    background: #e9ecef;
-                    padding: 15px;
-                    border-radius: 10px;
-                    margin-top: 20px;
-                    border-left: 4px solid #28a745;
-                }
-                
-                .info-box.warning {
-                    border-left-color: #ffc107;
-                    background: #fff3cd;
-                }
-                
-                .info-box.error {
-                    border-left-color: #dc3545;
-                    background: #f8d7da;
-                }
-                
-                @media (max-width: 768px) {
-                    .container {
-                        border-radius: 10px;
-                    }
-                    
-                    .header {
-                        padding: 20px;
-                    }
-                    
-                    .header h1 {
-                        font-size: 1.8rem;
-                    }
-                    
-                    .content {
-                        padding: 20px;
-                    }
-                    
-                    .stats {
-                        grid-template-columns: 1fr;
-                    }
-                    
-                    .actions {
-                        flex-direction: column;
-                    }
-                    
-                    .btn {
-                        width: 100%;
-                        text-align: center;
-                    }
-                }
-            </style>
-            <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-        </head>
-        <body>
-            <div class="container">
-                <div class="header">
-                    <h1><i class="fab fa-github"></i> GitHub Task Tracker</h1>
-                    <p>Data stored in GitHub repository • {}</p>
-                    <div class="github-badge">
-                        <i class="fas fa-database"></i> Synced to GitHub
-                    </div>
-                </div>
-                
-                <div class="stats">
-                    <div class="stat-card">
-                        <div class="stat-number">{}</div>
-                        <div class="stat-label">Total Tasks</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number">{}</div>
-                        <div class="stat-label">Last Update</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number">{}</div>
-                        <div class="stat-label">Storage</div>
-                    </div>
-                </div>
-                
-                <div class="content">
-                    <div class="section">
-                        <h2 class="section-title"><i class="fas fa-tasks"></i> Your Tasks (Newest First)</h2>
-                        
-                        {}
-                    </div>
-                    
-                    <div class="actions">
-                        <a href="/download" class="btn btn-download">
-                            <i class="fas fa-download"></i> Download GitHub JSON
-                        </a>
-                        <button onclick="clearData()" class="btn btn-clear">
-                            <i class="fas fa-trash"></i> Clear All Data
-                        </button>
-                        <a href="https://t.me/tasktracker_simple_bot" target="_blank" class="btn btn-telegram">
-                            <i class="fab fa-telegram"></i> Open Telegram
-                        </a>
-                        <button onclick="refreshData()" class="btn">
-                            <i class="fas fa-sync"></i> Refresh
-                        </button>
-                    </div>
-                    
-                    <div class="info-box">
-                        <p><i class="fas fa-info-circle"></i> <strong>How to use:</strong></p>
-                        <p>1. Send any message to Telegram bot - it auto-saves to GitHub</p>
-                        <p>2. View data here or download JSON</p>
-                        <p>3. Data is synced to GitHub repository</p>
-                    </div>
-                    
-                    {}
-                </div>
-            </div>
-            
-            <script>
-                function clearData() {
-                    if (confirm('⚠️ Delete ALL data from GitHub? This cannot be undone!')) {
-                        fetch('/clear', { method: 'POST' })
-                            .then(response => response.json())
-                            .then(data => {
-                                if (data.success) {
-                                    alert('✅ All data cleared from GitHub!');
-                                    location.reload();
-                                } else {
-                                    alert('❌ Error: ' + data.error);
-                                }
-                            })
-                            .catch(error => {
-                                alert('❌ Error: ' + error);
-                            });
-                    }
-                }
-                
-                function refreshData() {
-                    location.reload();
-                }
-                
-                // Auto-refresh every 30 seconds
-                setTimeout(() => {
-                    location.reload();
-                }, 30000);
-            </script>
-        </body>
-        </html>
-        '''
         
         # Prepare tasks HTML
         if not data["tasks"]:
@@ -799,14 +379,357 @@ def index():
         except:
             github_status = '<div class="info-box error"><i class="fas fa-times-circle"></i> <strong>GitHub Status:</strong> Connection error</div>'
         
-        return html.format(
-            now.strftime('%B %d, %Y %I:%M %p'),
-            len(data["tasks"]),
-            last_update,
-            "GitHub + Local",
-            tasks_html,
-            github_status
-        )
+        html = f'''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>GitHub Task Tracker</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                * {{
+                    margin: 0;
+                    padding: 0;
+                    box-sizing: border-box;
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                }}
+                
+                body {{
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    min-height: 100vh;
+                    padding: 20px;
+                }}
+                
+                .container {{
+                    max-width: 800px;
+                    margin: 0 auto;
+                    background: white;
+                    border-radius: 15px;
+                    box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+                    overflow: hidden;
+                }}
+                
+                .header {{
+                    background: linear-gradient(135deg, #24292e 0%, #0366d6 100%);
+                    color: white;
+                    padding: 25px;
+                    text-align: center;
+                }}
+                
+                .header h1 {{
+                    font-size: 2.2rem;
+                    margin-bottom: 10px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    gap: 10px;
+                }}
+                
+                .header p {{
+                    opacity: 0.9;
+                    font-size: 1rem;
+                }}
+                
+                .github-badge {{
+                    display: inline-block;
+                    background: rgba(255,255,255,0.1);
+                    padding: 5px 10px;
+                    border-radius: 20px;
+                    font-size: 0.8rem;
+                    margin-top: 5px;
+                }}
+                
+                .stats {{
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+                    gap: 15px;
+                    padding: 20px;
+                    background: #f8f9fa;
+                }}
+                
+                .stat-card {{
+                    background: white;
+                    padding: 20px;
+                    border-radius: 10px;
+                    text-align: center;
+                    box-shadow: 0 3px 10px rgba(0,0,0,0.1);
+                }}
+                
+                .stat-number {{
+                    font-size: 2rem;
+                    font-weight: bold;
+                    color: #0366d6;
+                    margin-bottom: 5px;
+                }}
+                
+                .stat-label {{
+                    color: #666;
+                    font-size: 0.9rem;
+                }}
+                
+                .content {{
+                    padding: 30px;
+                }}
+                
+                .section {{
+                    margin-bottom: 30px;
+                }}
+                
+                .section-title {{
+                    font-size: 1.3rem;
+                    color: #333;
+                    margin-bottom: 15px;
+                    padding-bottom: 10px;
+                    border-bottom: 2px solid #0366d6;
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                }}
+                
+                .section-title i {{
+                    color: #0366d6;
+                }}
+                
+                .task-list {{
+                    display: flex;
+                    flex-direction: column;
+                    gap: 15px;
+                }}
+                
+                .task-card {{
+                    background: #f8f9fa;
+                    border-radius: 10px;
+                    padding: 20px;
+                    border-left: 4px solid #0366d6;
+                    transition: transform 0.3s, box-shadow 0.3s;
+                }}
+                
+                .task-card:hover {{
+                    transform: translateY(-3px);
+                    box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+                }}
+                
+                .task-text {{
+                    font-size: 1.1rem;
+                    color: #333;
+                    margin-bottom: 10px;
+                    line-height: 1.4;
+                }}
+                
+                .task-meta {{
+                    display: flex;
+                    justify-content: space-between;
+                    font-size: 0.85rem;
+                    color: #666;
+                }}
+                
+                .empty-state {{
+                    text-align: center;
+                    padding: 40px 20px;
+                    color: #666;
+                }}
+                
+                .empty-state i {{
+                    font-size: 3rem;
+                    margin-bottom: 15px;
+                    opacity: 0.3;
+                }}
+                
+                .empty-state p {{
+                    font-size: 1.1rem;
+                    margin-bottom: 20px;
+                }}
+                
+                .btn {{
+                    display: inline-block;
+                    background: #0366d6;
+                    color: white;
+                    padding: 12px 25px;
+                    border-radius: 8px;
+                    text-decoration: none;
+                    font-weight: 600;
+                    transition: background 0.3s;
+                    border: none;
+                    cursor: pointer;
+                    font-size: 1rem;
+                }}
+                
+                .btn:hover {{
+                    background: #005cc5;
+                }}
+                
+                .btn-download {{
+                    background: #28a745;
+                }}
+                
+                .btn-download:hover {{
+                    background: #218838;
+                }}
+                
+                .btn-clear {{
+                    background: #dc3545;
+                }}
+                
+                .btn-clear:hover {{
+                    background: #c82333;
+                }}
+                
+                .btn-telegram {{
+                    background: #0088cc;
+                }}
+                
+                .btn-telegram:hover {{
+                    background: #0077b5;
+                }}
+                
+                .actions {{
+                    display: flex;
+                    gap: 15px;
+                    margin-top: 20px;
+                    flex-wrap: wrap;
+                }}
+                
+                .info-box {{
+                    background: #e9ecef;
+                    padding: 15px;
+                    border-radius: 10px;
+                    margin-top: 20px;
+                    border-left: 4px solid #28a745;
+                }}
+                
+                .info-box.warning {{
+                    border-left-color: #ffc107;
+                    background: #fff3cd;
+                }}
+                
+                .info-box.error {{
+                    border-left-color: #dc3545;
+                    background: #f8d7da;
+                }}
+                
+                @media (max-width: 768px) {{
+                    .container {{
+                        border-radius: 10px;
+                    }}
+                    
+                    .header {{
+                        padding: 20px;
+                    }}
+                    
+                    .header h1 {{
+                        font-size: 1.8rem;
+                    }}
+                    
+                    .content {{
+                        padding: 20px;
+                    }}
+                    
+                    .stats {{
+                        grid-template-columns: 1fr;
+                    }}
+                    
+                    .actions {{
+                        flex-direction: column;
+                    }}
+                    
+                    .btn {{
+                        width: 100%;
+                        text-align: center;
+                    }}
+                }}
+            </style>
+            <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1><i class="fab fa-github"></i> GitHub Task Tracker</h1>
+                    <p>Data stored in GitHub repository • {now.strftime('%B %d, %Y %I:%M %p')}</p>
+                    <div class="github-badge">
+                        <i class="fas fa-database"></i> Synced to GitHub
+                    </div>
+                </div>
+                
+                <div class="stats">
+                    <div class="stat-card">
+                        <div class="stat-number">{len(data["tasks"])}</div>
+                        <div class="stat-label">Total Tasks</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">{last_update}</div>
+                        <div class="stat-label">Last Update</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">GitHub + Local</div>
+                        <div class="stat-label">Storage</div>
+                    </div>
+                </div>
+                
+                <div class="content">
+                    <div class="section">
+                        <h2 class="section-title"><i class="fas fa-tasks"></i> Your Tasks (Newest First)</h2>
+                        
+                        {tasks_html}
+                    </div>
+                    
+                    <div class="actions">
+                        <a href="/download" class="btn btn-download">
+                            <i class="fas fa-download"></i> Download GitHub JSON
+                        </a>
+                        <button onclick="clearData()" class="btn btn-clear">
+                            <i class="fas fa-trash"></i> Clear All Data
+                        </button>
+                        <a href="https://t.me/tasktracker_simple_bot" target="_blank" class="btn btn-telegram">
+                            <i class="fab fa-telegram"></i> Open Telegram
+                        </a>
+                        <button onclick="refreshData()" class="btn">
+                            <i class="fas fa-sync"></i> Refresh
+                        </button>
+                    </div>
+                    
+                    <div class="info-box">
+                        <p><i class="fas fa-info-circle"></i> <strong>How to use:</strong></p>
+                        <p>1. Send any message to Telegram bot - it auto-saves to GitHub</p>
+                        <p>2. View data here or download JSON</p>
+                        <p>3. Data is synced to GitHub repository</p>
+                    </div>
+                    
+                    {github_status}
+                </div>
+            </div>
+            
+            <script>
+                function clearData() {{
+                    if (confirm('⚠️ Delete ALL data from GitHub? This cannot be undone!')) {{
+                        fetch('/clear', {{ method: 'POST' }})
+                            .then(response => response.json())
+                            .then(data => {{
+                                if (data.success) {{
+                                    alert('✅ All data cleared from GitHub!');
+                                    location.reload();
+                                }} else {{
+                                    alert('❌ Error: ' + data.error);
+                                }}
+                            }})
+                            .catch(error => {{
+                                alert('❌ Error: ' + error);
+                            }});
+                    }}
+                }}
+                
+                function refreshData() {{
+                    location.reload();
+                }}
+                
+                // Auto-refresh every 30 seconds
+                setTimeout(() => {{
+                    location.reload();
+                }}, 30000);
+            </script>
+        </body>
+        </html>
+        '''
+        
+        return html
     except Exception as e:
         # Return a simple error page
         error_html = f"""
@@ -832,7 +755,6 @@ def download_json():
         response = requests.get(url)
         
         if response.status_code == 200:
-            from flask import Response
             return Response(
                 response.content,
                 mimetype="application/json",
@@ -842,7 +764,6 @@ def download_json():
         # Fallback to API method
         github_data = download_from_github()
         if github_data:
-            from flask import Response
             return Response(
                 github_data,
                 mimetype="application/json",
@@ -853,7 +774,6 @@ def download_json():
         data = load_data()
         json_data = json.dumps(data, indent=2, ensure_ascii=False)
         
-        from flask import Response
         return Response(
             json_data,
             mimetype="application/json",
@@ -913,29 +833,18 @@ def start_bot():
     
     # Test GitHub connection
     print("🔗 Testing GitHub connection...")
-    if GITHUB_TOKEN == "YOUR_GITHUB_TOKEN_HERE":
-        print("❌ Please set your GitHub token in the code!")
+    test_data = load_from_github()
+    if test_data is not None:
+        print("✅ GitHub connection successful!")
     else:
-        test_data = load_from_github()
-        if test_data is not None:
-            print("✅ GitHub connection successful!")
-        else:
-            print("⚠️ GitHub connection failed, using local backup only")
+        print("⚠️ GitHub connection failed, using local backup only")
     
     try:
         bot.polling(none_stop=True, interval=1, timeout=30)
     except Exception as e:
         print(f"❌ Bot error: {e}")
 
-# ============= KOYEB COMPATIBLE ENTRY POINT =============
-def create_app():
-    """Create Flask app for Koyeb"""
-    # Start bot in background thread
-    bot_thread = threading.Thread(target=start_bot, daemon=True)
-    bot_thread.start()
-    return app
-
-# For local development
+# ============= MAIN =============
 if __name__ == '__main__':
     # Create initial local backup if it doesn't exist
     if not os.path.exists(LOCAL_DATA_FILE):
@@ -956,6 +865,6 @@ if __name__ == '__main__':
     bot_thread.start()
     
     # Start Flask app
-    print("🚀 Starting web server on port 8080...")
-    print("👉 Web interface: http://localhost:8080")
-    app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
+    port = int(os.environ.get('PORT', 8080))
+    print(f"🚀 Starting web server on port {port}...")
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)

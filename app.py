@@ -1,577 +1,522 @@
 """
-Telegram Bot for Koyeb Free Tier - Complete Solution
-No background workers needed - Uses threading + APScheduler
-URL: patient-maxie-sandip232-786edcb8.koyeb.app
+Simplified Telegram Bot for Task Tracker Notifications
+Monitors JSON files and sends Telegram notifications
 """
 
-from flask import Flask, request, jsonify
-import telebot
-import threading
-import time
-from datetime import datetime
 import os
-import atexit
-from apscheduler.schedulers.background import BackgroundScheduler
-import schedule
-import requests
-import sqlite3
 import json
+import time
+import threading
+from datetime import datetime, timedelta
+import telebot
+from flask import Flask, request, jsonify
 
 # ============= CONFIGURATION =============
 BOT_TOKEN = "8388773187:AAFxz5U8GJ94Wf21VaGvFx9QQSZFU2Rd43I"
 USER_ID = "8469993808"
-KOYEB_URL = "patient-maxie-sandip232-786edcb8.koyeb.app"
 ADMIN_PASSWORD = "admin123"
+
+# File paths
+TASKS_FILE = "tasks.json"
+NOTES_FILE = "notes.json"
+NOTIFICATIONS_FILE = "notifications.json"
+TELEGRAM_LOG_FILE = "telegram_log.json"
 
 # ============= INITIALIZE =============
 app = Flask(__name__)
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # Global variables
-message_count = 0
-last_message_time = None
-scheduler_active = True
+monitor_active = True
 app_start_time = datetime.now()
 
-# Initialize APScheduler for keep-alive
-keepalive_scheduler = BackgroundScheduler()
+# ============= HELPER FUNCTIONS =============
+def load_json_file(filepath):
+    """Load data from JSON file"""
+    try:
+        if os.path.exists(filepath):
+            with open(filepath, 'r') as f:
+                return json.load(f)
+    except:
+        pass
+    return []
 
-# ============= DATABASE SETUP =============
-def init_db():
-    """Initialize SQLite database"""
-    conn = sqlite3.connect('/tmp/bot_data.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS bot_logs
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  timestamp DATETIME,
-                  type TEXT,
-                  message TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS messages
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  timestamp DATETIME,
-                  chat_id TEXT,
-                  message_text TEXT,
-                  direction TEXT)''')
-    conn.commit()
-    conn.close()
-    log_activity("DATABASE", "Database initialized")
+def save_json_file(filepath, data):
+    """Save data to JSON file"""
+    try:
+        with open(filepath, 'w') as f:
+            json.dump(data, f, indent=2)
+        return True
+    except:
+        return False
 
-def log_activity(log_type, message):
-    """Log activity to database"""
-    conn = sqlite3.connect('/tmp/bot_data.db')
-    c = conn.cursor()
-    c.execute("INSERT INTO bot_logs (timestamp, type, message) VALUES (?, ?, ?)",
-              (datetime.now(), log_type, message))
-    conn.commit()
-    conn.close()
-    print(f"[{log_type}] {message}")
+def log_telegram_notification(message, success=True):
+    """Log Telegram notification"""
+    logs = load_json_file(TELEGRAM_LOG_FILE)
+    if not isinstance(logs, list):
+        logs = []
+    
+    logs.append({
+        'timestamp': datetime.now().isoformat(),
+        'message': message[:100] + '...' if len(message) > 100 else message,
+        'success': success
+    })
+    
+    # Keep only last 50 logs
+    if len(logs) > 50:
+        logs = logs[-50:]
+    
+    save_json_file(TELEGRAM_LOG_FILE, logs)
 
-def log_message(chat_id, text, direction="outgoing"):
-    """Log message to database"""
-    conn = sqlite3.connect('/tmp/bot_data.db')
-    c = conn.cursor()
-    c.execute("INSERT INTO messages (timestamp, chat_id, message_text, direction) VALUES (?, ?, ?, ?)",
-              (datetime.now(), chat_id, text, direction))
-    conn.commit()
-    conn.close()
+def send_telegram_message(text):
+    """Send message to Telegram"""
+    try:
+        bot.send_message(USER_ID, text, parse_mode='HTML')
+        log_telegram_notification(text, True)
+        return True
+    except Exception as e:
+        log_telegram_notification(f"Error: {str(e)}", False)
+        return False
 
-def get_stats():
-    """Get statistics"""
-    conn = sqlite3.connect('/tmp/bot_data.db')
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM messages WHERE direction='outgoing'")
-    outgoing = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM messages WHERE direction='incoming'")
-    incoming = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM bot_logs")
-    logs = c.fetchone()[0]
-    conn.close()
-    return {
-        'outgoing_messages': outgoing,
-        'incoming_messages': incoming,
-        'total_logs': logs,
-        'scheduled_count': message_count
-    }
+# ============= MONITORING FUNCTIONS =============
+def check_task_reminders():
+    """Check and send task reminders"""
+    try:
+        tasks = load_json_file(TASKS_FILE)
+        if not tasks:
+            return
+        
+        current_time = datetime.now()
+        
+        for task in tasks:
+            # Skip if task is completed or notifications disabled
+            if task.get('completed') or not task.get('notify_enabled'):
+                continue
+            
+            task_id = task.get('id')
+            task_title = task.get('title', 'Untitled Task')
+            start_time_str = task.get('start_time')
+            last_notified = task.get('last_notified')
+            
+            if not start_time_str:
+                continue
+            
+            try:
+                start_time = datetime.strptime(start_time_str, '%Y-%m-%d %H:%M:%S')
+            except:
+                continue
+            
+            # Calculate time difference in minutes
+            time_diff = (start_time - current_time).total_seconds() / 60
+            
+            # Send 10 reminders in the 10 minutes before task starts
+            if 0 < time_diff <= 10:
+                # Check if we need to send a reminder
+                reminder_minutes = int(time_diff)
+                
+                # Send reminder if it's the right minute (1, 2, 3, ..., 10 minutes before)
+                if reminder_minutes in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
+                    # Check if we already sent this reminder
+                    if last_notified:
+                        try:
+                            last_time = datetime.strptime(last_notified, '%Y-%m-%d %H:%M:%S')
+                            minutes_since_last = (current_time - last_time).total_seconds() / 60
+                            if minutes_since_last < 1:  # Less than 1 minute ago
+                                continue
+                        except:
+                            pass
+                    
+                    # Send reminder
+                    message = f"⏰ <b>Task Reminder</b>\n"
+                    message += f"📝 <b>{task_title}</b>\n"
+                    message += f"🕐 Starts in {reminder_minutes} minute{'s' if reminder_minutes > 1 else ''}\n"
+                    message += f"📅 {start_time.strftime('%I:%M %p')}\n"
+                    
+                    if send_telegram_message(message):
+                        # Update last_notified time
+                        task['last_notified'] = current_time.strftime('%Y-%m-%d %H:%M:%S')
+                        save_json_file(TASKS_FILE, tasks)
+            
+    except Exception as e:
+        print(f"Error checking task reminders: {e}")
 
-# ============= TELEGRAM HANDLERS =============
+def check_note_reminders():
+    """Check and send note reminders"""
+    try:
+        notes = load_json_file(NOTES_FILE)
+        if not notes:
+            return
+        
+        current_time = datetime.now()
+        
+        for note in notes:
+            # Skip if notifications disabled
+            if not note.get('notify_enabled'):
+                continue
+            
+            note_id = note.get('id')
+            note_title = note.get('title', 'Untitled Note')
+            interval_hours = note.get('notify_interval', 0)
+            last_notified = note.get('last_notified')
+            
+            if interval_hours <= 0:
+                continue
+            
+            # Check if it's time to send reminder
+            if last_notified:
+                try:
+                    last_time = datetime.strptime(last_notified, '%Y-%m-%d %H:%M:%S')
+                    hours_since_last = (current_time - last_time).total_seconds() / 3600
+                    
+                    if hours_since_last < interval_hours:
+                        continue
+                except:
+                    pass
+            
+            # Send note reminder
+            message = f"📝 <b>Note Reminder</b>\n"
+            message += f"📌 <b>{note_title}</b>\n"
+            message += f"🕐 Interval: Every {interval_hours} hours\n"
+            message += f"⏰ {current_time.strftime('%I:%M %p')}\n"
+            
+            description = note.get('description', '')
+            if description:
+                # Strip HTML tags and limit length
+                import re
+                clean_desc = re.sub('<[^<]+?>', '', description)
+                if len(clean_desc) > 200:
+                    clean_desc = clean_desc[:200] + '...'
+                message += f"\n{clean_desc}"
+            
+            if send_telegram_message(message):
+                # Update last_notified time
+                note['last_notified'] = current_time.strftime('%Y-%m-%d %H:%M:%S')
+                save_json_file(NOTES_FILE, notes)
+            
+    except Exception as e:
+        print(f"Error checking note reminders: {e}")
+
+def send_hourly_report():
+    """Send hourly task status report"""
+    try:
+        notification_settings = load_json_file(NOTIFICATIONS_FILE)
+        if not isinstance(notification_settings, dict):
+            notification_settings = {}
+        
+        # Check if hourly reports are enabled
+        if not notification_settings.get('hourly_report', True):
+            return
+        
+        tasks = load_json_file(TASKS_FILE)
+        if not tasks:
+            return
+        
+        current_time = datetime.now()
+        current_date = current_time.date()
+        
+        # Filter tasks for today
+        today_tasks = []
+        for task in tasks:
+            try:
+                task_date = datetime.strptime(task.get('start_time', ''), '%Y-%m-%d %H:%M:%S').date()
+                if task_date == current_date:
+                    today_tasks.append(task)
+            except:
+                pass
+        
+        if not today_tasks:
+            message = f"📊 <b>Hourly Task Report</b>\n"
+            message += f"🕐 {current_time.strftime('%I:%M %p')}\n"
+            message += f"📅 {current_time.strftime('%B %d, %Y')}\n"
+            message += f"✅ No tasks for today!"
+        else:
+            completed_tasks = [t for t in today_tasks if t.get('completed')]
+            pending_tasks = [t for t in today_tasks if not t.get('completed')]
+            
+            message = f"📊 <b>Hourly Task Report</b>\n"
+            message += f"🕐 {current_time.strftime('%I:%M %p')}\n"
+            message += f"📅 {current_time.strftime('%B %d, %Y')}\n"
+            message += f"📋 Total: {len(today_tasks)} tasks\n\n"
+            
+            message += f"✅ <b>Completed ({len(completed_tasks)})</b>\n"
+            for task in completed_tasks[:5]:  # Show first 5 completed
+                message += f"   ✓ {task.get('title', 'Untitled')}\n"
+            if len(completed_tasks) > 5:
+                message += f"   ... and {len(completed_tasks) - 5} more\n"
+            
+            message += f"\n⏳ <b>Pending ({len(pending_tasks)})</b>\n"
+            for task in pending_tasks[:5]:  # Show first 5 pending
+                start_time = datetime.strptime(task.get('start_time', ''), '%Y-%m-%d %H:%M:%S')
+                time_str = start_time.strftime('%I:%M %p')
+                message += f"   • {task.get('title', 'Untitled')} ({time_str})\n"
+            if len(pending_tasks) > 5:
+                message += f"   ... and {len(pending_tasks) - 5} more\n"
+        
+        send_telegram_message(message)
+        
+    except Exception as e:
+        print(f"Error sending hourly report: {e}")
+
+def monitoring_loop():
+    """Main monitoring loop"""
+    global monitor_active
+    
+    last_hourly_report = datetime.now()
+    last_minute_check = datetime.now()
+    
+    while monitor_active:
+        try:
+            current_time = datetime.now()
+            
+            # Check task reminders every minute
+            if (current_time - last_minute_check).total_seconds() >= 60:
+                check_task_reminders()
+                check_note_reminders()
+                last_minute_check = current_time
+            
+            # Send hourly report
+            if (current_time - last_hourly_report).total_seconds() >= 3600:
+                send_hourly_report()
+                last_hourly_report = current_time
+            
+            time.sleep(10)  # Sleep for 10 seconds
+            
+        except Exception as e:
+            print(f"Monitoring error: {e}")
+            time.sleep(30)
+
+# ============= TELEGRAM COMMANDS =============
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    global message_count
-    message_count += 1
+    """Send welcome message"""
+    if str(message.chat.id) != USER_ID:
+        bot.reply_to(message, "❌ Unauthorized access")
+        return
     
-    welcome_msg = f"""
-🤖 *Welcome to Koyeb Telegram Bot!*
+    welcome_msg = """
+🤖 <b>Task Tracker Bot</b>
 
-*URL:* {KOYEB_URL}
-*Status:* ✅ Online
-*Scheduled Messages:* {message_count}
-*Uptime:* {get_uptime()}
+I monitor your tasks and notes, sending reminders and reports.
 
-*Commands:*
-/start - Show this message
-/status - Bot status  
-/time - Server time
-/stats - Message statistics
-/now - Send immediate message
-/schedule on|off - Control scheduler
+<b>Commands:</b>
+/status - Check bot status
+/report - Get current task status
+/test - Send test notification
+/help - Show this message
 
-*Admin:* /admin [password]
+<b>Features:</b>
+• Task reminders (10 minutes before start)
+• Note reminders (custom intervals)
+• Hourly status reports
+• Real-time monitoring
 """
-    bot.reply_to(message, welcome_msg, parse_mode='Markdown')
-    log_message(message.chat.id, "/start", "incoming")
-    log_activity("COMMAND", f"/start from {message.chat.id}")
+    bot.reply_to(message, welcome_msg, parse_mode='HTML')
 
 @bot.message_handler(commands=['status'])
 def send_status(message):
-    stats = get_stats()
-    status_msg = f"""
-📊 *Bot Status Report*
-
-*Platform:* Koyeb Free Tier
-*URL:* {KOYEB_URL}
-*Status:* {'🟢 Running' if scheduler_active else '⏸️ Paused'}
-*Uptime:* {get_uptime()}
-*Messages:* {stats['outgoing_messages']} sent, {stats['incoming_messages']} received
-*Last Scheduled:* {last_message_time or 'None yet'}
-*Memory:* Threading + APScheduler
-"""
-    bot.reply_to(message, status_msg, parse_mode='Markdown')
-    log_message(message.chat.id, "/status", "incoming")
-
-@bot.message_handler(commands=['time'])
-def send_time(message):
-    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
-    bot.reply_to(message, f"🕐 *Server Time:*\n`{current_time}`", parse_mode='Markdown')
-    log_message(message.chat.id, "/time", "incoming")
-
-@bot.message_handler(commands=['stats'])
-def send_stats(message):
-    stats = get_stats()
-    stats_msg = f"""
-📈 *Message Statistics*
-
-*Total Sent:* {stats['outgoing_messages']}
-*Total Received:* {stats['incoming_messages']}
-*Scheduled Count:* {message_count}
-*Log Entries:* {stats['total_logs']}
-*Uptime:* {get_uptime()}
-*Scheduler:* {'✅ Active' if scheduler_active else '⏸️ Paused'}
-"""
-    bot.reply_to(message, stats_msg, parse_mode='Markdown')
-    log_message(message.chat.id, "/stats", "incoming")
-
-@bot.message_handler(commands=['now'])
-def send_now_cmd(message):
-    """Send immediate message via command"""
-    current_time = datetime.now().strftime('%H:%M:%S')
-    msg = f"🚀 *Immediate Message*\nTime: {current_time}\nFrom: Command\nChat ID: {message.chat.id}"
-    bot.send_message(message.chat.id, msg, parse_mode='Markdown')
-    log_message(message.chat.id, "/now command", "incoming")
-
-@bot.message_handler(commands=['schedule'])
-def control_schedule(message):
-    global scheduler_active
-    parts = message.text.split()
-    if len(parts) > 1:
-        command = parts[1].lower()
-        if command == 'on':
-            scheduler_active = True
-            response = "✅ Scheduler activated"
-        elif command == 'off':
-            scheduler_active = False
-            response = "⏸️ Scheduler paused"
-        else:
-            response = "Usage: /schedule on|off"
-    else:
-        response = f"Scheduler is {'✅ ON' if scheduler_active else '⏸️ OFF'}"
-    
-    bot.reply_to(message, response, parse_mode='Markdown')
-    log_message(message.chat.id, f"/schedule {parts[1] if len(parts)>1 else 'status'}", "incoming")
-
-@bot.message_handler(commands=['admin'])
-def admin_command(message):
-    parts = message.text.split()
-    if len(parts) > 1 and parts[1] == ADMIN_PASSWORD:
-        admin_msg = f"""
-🔐 *Admin Panel*
-
-*URL:* {KOYEB_URL}
-*Token:* {BOT_TOKEN[:10]}...
-*User ID:* {USER_ID}
-*Webhook:* https://{KOYEB_URL}/webhook
-*Admin Panel:* https://{KOYEB_URL}/admin?password={ADMIN_PASSWORD}
-*Health Check:* https://{KOYEB_URL}/health
-"""
-        bot.reply_to(message, admin_msg, parse_mode='Markdown')
-    else:
-        bot.reply_to(message, "❌ Admin access required", parse_mode='Markdown')
-    log_message(message.chat.id, "/admin attempt", "incoming")
-
-@bot.message_handler(func=lambda message: True)
-def echo_all(message):
-    response = f"Echo: *{message.text}*\n\nSend /help for commands"
-    bot.reply_to(message, response, parse_mode='Markdown')
-    log_message(message.chat.id, message.text, "incoming")
-
-# ============= SCHEDULED MESSAGES =============
-def send_scheduled_message():
-    """Send scheduled message every minute"""
-    global message_count, last_message_time
-    
-    if not scheduler_active:
+    """Send bot status"""
+    if str(message.chat.id) != USER_ID:
+        bot.reply_to(message, "❌ Unauthorized access")
         return
     
-    try:
-        current_time = datetime.now().strftime('%H:%M:%S')
-        uptime = get_uptime()
-        stats = get_stats()
-        
-        message = f"""
-⏰ *Automatic Message from Koyeb*
+    uptime = datetime.now() - app_start_time
+    hours = uptime.seconds // 3600
+    minutes = (uptime.seconds % 3600) // 60
+    
+    tasks = load_json_file(TASKS_FILE)
+    notes = load_json_file(NOTES_FILE)
+    
+    status_msg = f"""
+📊 <b>Bot Status</b>
 
-*Time:* {current_time}
-*URL:* {KOYEB_URL}
-*Message #:* {message_count + 1}
-*Total Sent:* {stats['outgoing_messages']}
-*Uptime:* {uptime}
-*Status:* ✅ Everything working perfectly!
+✅ <b>Online</b>
+⏰ Uptime: {uptime.days}d {hours}h {minutes}m
+📅 Started: {app_start_time.strftime('%Y-%m-%d %H:%M')}
 
-Next message in 1 minute. ⏱️
+<b>Statistics:</b>
+📋 Tasks: {len(tasks) if tasks else 0}
+📝 Notes: {len(notes) if notes else 0}
+🔔 Monitor: {'Active' if monitor_active else 'Paused'}
+
+<b>Last Check:</b> {datetime.now().strftime('%H:%M:%S')}
 """
-        bot.send_message(USER_ID, message, parse_mode='Markdown')
-        
-        message_count += 1
-        last_message_time = current_time
-        log_message(USER_ID, f"Scheduled #{message_count}", "outgoing")
-        log_activity("SCHEDULER", f"Message #{message_count} sent at {current_time}")
-        
-        # Schedule next message
-        threading.Timer(60.0, send_scheduled_message).start()
-        
-    except Exception as e:
-        log_activity("ERROR", f"Scheduler error: {str(e)}")
-        # Retry after 30 seconds
-        threading.Timer(30.0, send_scheduled_message).start()
+    bot.reply_to(message, status_msg, parse_mode='HTML')
+
+@bot.message_handler(commands=['report'])
+def send_report(message):
+    """Send current task report"""
+    if str(message.chat.id) != USER_ID:
+        bot.reply_to(message, "❌ Unauthorized access")
+        return
+    
+    send_hourly_report()
+    bot.reply_to(message, "📊 Report sent!")
+
+@bot.message_handler(commands=['test'])
+def send_test(message):
+    """Send test notification"""
+    if str(message.chat.id) != USER_ID:
+        bot.reply_to(message, "❌ Unauthorized access")
+        return
+    
+    test_msg = f"""
+✅ <b>Test Notification</b>
+
+Time: {datetime.now().strftime('%H:%M:%S')}
+Date: {datetime.now().strftime('%Y-%m-%d')}
+Status: Bot is working correctly!
+
+This is a test message to verify Telegram notifications are working.
+"""
+    if send_telegram_message(test_msg):
+        bot.reply_to(message, "✅ Test message sent!")
+    else:
+        bot.reply_to(message, "❌ Failed to send test message")
+
+@bot.message_handler(func=lambda message: True)
+def handle_message(message):
+    """Handle other messages"""
+    if str(message.chat.id) != USER_ID:
+        bot.reply_to(message, "❌ Unauthorized access")
+        return
+    
+    response = f"""
+Echo: <b>{message.text}</b>
+
+Send /help for available commands.
+"""
+    bot.reply_to(message, response, parse_mode='HTML')
 
 # ============= WEB ROUTES =============
 @app.route('/')
 def home():
-    stats = get_stats()
-    return f"""
+    """Home page"""
+    return """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>🤖 Koyeb Telegram Bot</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Task Tracker Bot</title>
         <style>
-            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-            body {{
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-                min-height: 100vh;
-                padding: 20px;
-            }}
-            .container {{
-                max-width: 1000px;
+            body {
+                font-family: Arial, sans-serif;
+                max-width: 800px;
                 margin: 0 auto;
-                background: white;
-                border-radius: 20px;
-                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-                overflow: hidden;
-            }}
-            header {{
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                padding: 40px;
-                text-align: center;
-            }}
-            header h1 {{
-                font-size: 2.8em;
-                margin-bottom: 10px;
-            }}
-            .stats-grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-                gap: 20px;
-                padding: 30px;
-            }}
-            .stat-card {{
-                background: #f8f9fa;
-                border-radius: 15px;
-                padding: 25px;
-                text-align: center;
-                transition: all 0.3s;
-            }}
-            .stat-card:hover {{
-                transform: translateY(-5px);
-                box-shadow: 0 10px 25px rgba(0,0,0,0.1);
-            }}
-            .stat-value {{
-                font-size: 2.8em;
-                font-weight: bold;
-                color: #667eea;
-                margin: 10px 0;
-            }}
-            .controls {{
-                padding: 30px;
-                background: #f8f9fa;
-                margin: 20px;
-                border-radius: 15px;
-                text-align: center;
-            }}
-            .btn {{
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-                border: none;
-                padding: 15px 30px;
-                border-radius: 50px;
-                font-size: 16px;
-                cursor: pointer;
-                margin: 10px;
-                transition: all 0.3s;
-                text-decoration: none;
-                display: inline-block;
-            }}
-            .btn:hover {{
-                transform: scale(1.05);
-                box-shadow: 0 10px 20px rgba(0,0,0,0.2);
-            }}
-            .btn-success {{ background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); }}
-            .btn-danger {{ background: linear-gradient(135deg, #ff416c 0%, #ff4b2b 100%); }}
-            .btn-warning {{ background: linear-gradient(135deg, #f7971e 0%, #ffd200 100%); }}
-            .info-box {{
-                background: #e9f7fe;
-                padding: 25px;
-                margin: 20px;
-                border-radius: 15px;
-                border-left: 5px solid #2196F3;
-            }}
-            .footer {{
-                text-align: center;
                 padding: 20px;
-                color: #666;
-                font-size: 0.9em;
-                border-top: 1px solid #eee;
-            }}
-            @media (max-width: 768px) {{
-                .container {{ margin: 10px; border-radius: 15px; }}
-                header h1 {{ font-size: 2em; }}
-                .stats-grid {{ grid-template-columns: 1fr; padding: 15px; }}
-                .controls {{ margin: 10px; padding: 20px; }}
-            }}
+                background: #f5f5f5;
+            }
+            .container {
+                background: white;
+                padding: 30px;
+                border-radius: 10px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            h1 {
+                color: #333;
+                border-bottom: 2px solid #4CAF50;
+                padding-bottom: 10px;
+            }
+            .status {
+                padding: 15px;
+                background: #e8f5e9;
+                border-radius: 5px;
+                margin: 20px 0;
+            }
+            .btn {
+                display: inline-block;
+                background: #4CAF50;
+                color: white;
+                padding: 10px 20px;
+                text-decoration: none;
+                border-radius: 5px;
+                margin: 5px;
+            }
+            .btn:hover {
+                background: #45a049;
+            }
         </style>
     </head>
     <body>
         <div class="container">
-            <header>
-                <h1>🤖 Telegram Bot on Koyeb</h1>
-                <p style="opacity: 0.9;">Free Tier • No Workers Needed • Scheduled Messages</p>
-                <p style="margin-top: 10px; font-size: 1.2em;">{KOYEB_URL}</p>
-            </header>
+            <h1>🤖 Task Tracker Bot</h1>
             
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <h3>📨 Messages Sent</h3>
-                    <div class="stat-value">{stats['outgoing_messages']}</div>
-                    <p>Scheduled: {message_count}</p>
-                </div>
-                <div class="stat-card">
-                    <h3>⏰ Uptime</h3>
-                    <div class="stat-value">{get_uptime().split()[0]}</div>
-                    <p>{get_uptime()}</p>
-                </div>
-                <div class="stat-card">
-                    <h3>📊 Status</h3>
-                    <div class="stat-value" style="color: {'#28a745' if scheduler_active else '#ffc107'}">
-                        {'✅ ON' if scheduler_active else '⏸️ OFF'}
-                    </div>
-                    <p>Scheduler Active</p>
-                </div>
-                <div class="stat-card">
-                    <h3>🕐 Server Time</h3>
-                    <div class="stat-value">{datetime.now().strftime('%H:%M')}</div>
-                    <p>{datetime.now().strftime('%Y-%m-%d')}</p>
-                </div>
+            <div class="status">
+                <h3>✅ Bot Status: Online</h3>
+                <p><strong>Uptime:</strong> """ + str(datetime.now() - app_start_time).split('.')[0] + """</p>
+                <p><strong>Started:</strong> """ + app_start_time.strftime('%Y-%m-%d %H:%M:%S') + """</p>
+                <p><strong>Monitoring:</strong> """ + ("Active" if monitor_active else "Paused") + """</p>
             </div>
             
-            <div class="controls">
-                <h2 style="color: #333; margin-bottom: 20px;">⚡ Quick Actions</h2>
-                <a href="/send_now" class="btn">📨 Send Message Now</a>
-                <a href="/health" class="btn btn-success">❤️ Health Check</a>
-                <a href="/start_schedule" class="btn">▶️ Start Schedule</a>
-                <a href="/stop_schedule" class="btn btn-warning">⏸️ Stop Schedule</a>
-                <a href="/setup_webhook" class="btn">🔗 Setup Webhook</a>
-                <a href="/admin?password={ADMIN_PASSWORD}" class="btn btn-danger">🔐 Admin Panel</a>
-            </div>
+            <h3>📊 Statistics</h3>
+            <p><strong>Tasks:</strong> """ + str(len(load_json_file(TASKS_FILE))) + """</p>
+            <p><strong>Notes:</strong> """ + str(len(load_json_file(NOTES_FILE))) + """</p>
             
-            <div class="info-box">
-                <h3 style="color: #333;">🎯 How It Works (Free Tier)</h3>
-                <p style="color: #555; margin-top: 10px; line-height: 1.6;">
-                    ✅ <strong>No background workers needed</strong> - Uses Flask threading<br>
-                    ✅ <strong>Scheduled messages every minute</strong> - Threading.Timer based<br>
-                    ✅ <strong>Auto-restart mechanism</strong> - Recursive threading calls<br>
-                    ✅ <strong>Keep-alive pings</strong> - APScheduler every 5 minutes<br>
-                    ✅ <strong>Database logging</strong> - SQLite for persistence<br>
-                    ✅ <strong>Web admin panel</strong> - Full control via browser
-                </p>
-            </div>
+            <h3>⚡ Quick Actions</h3>
+            <a href="/send_test" class="btn">Send Test Message</a>
+            <a href="/send_report" class="btn">Send Hourly Report</a>
+            <a href="/status" class="btn">Bot Status</a>
             
-            <div class="controls">
-                <h2 style="color: #333;">📝 Recent Activity</h2>
-                <div style="background: white; padding: 15px; border-radius: 10px; max-height: 200px; overflow-y: auto;">
-                    <pre style="color: #333; font-family: monospace; font-size: 12px;">
-{get_recent_logs(5)}
-                    </pre>
-                </div>
-            </div>
+            <h3>📱 Telegram Commands</h3>
+            <p>Send these commands to the bot:</p>
+            <ul>
+                <li><code>/start</code> - Welcome message</li>
+                <li><code>/status</code> - Bot status</li>
+                <li><code>/report</code> - Task report</li>
+                <li><code>/test</code> - Test notification</li>
+                <li><code>/help</code> - Help menu</li>
+            </ul>
             
-            <div class="footer">
-                <p>Deployed on Koyeb Free Tier • GitHub Integration • exploitbit.pythonanywhere.com</p>
-                <p>Bot Token: {BOT_TOKEN[:10]}... • User ID: {USER_ID} • Password: {ADMIN_PASSWORD}</p>
-                <p>Auto-refresh: 30 seconds • Keep-alive: 5 minutes</p>
-            </div>
+            <h3>🔔 Features</h3>
+            <ul>
+                <li>Task reminders (10 minutes before start)</li>
+                <li>Note reminders (custom intervals)</li>
+                <li>Hourly status reports (24x per day)</li>
+                <li>Real-time monitoring</li>
+            </ul>
+            
+            <p style="margin-top: 30px; color: #666; font-size: 0.9em;">
+                Bot User ID: """ + USER_ID + """<br>
+                Last updated: """ + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + """
+            </p>
         </div>
-        
-        <script>
-            // Auto-refresh every 30 seconds
-            setTimeout(() => location.reload(), 30000);
-            
-            // Auto-start schedule if not active
-            window.addEventListener('load', function() {{
-                fetch('/start_schedule').catch(() => {{}});
-            }});
-            
-            // Confirm dangerous actions
-            document.querySelectorAll('.btn-danger, .btn-warning').forEach(btn => {{
-                btn.addEventListener('click', function(e) {{
-                    if (!confirm('Are you sure?')) {{
-                        e.preventDefault();
-                    }}
-                }});
-            }});
-        </script>
     </body>
     </html>
     """
 
-@app.route('/health')
-def health():
-    """Health check endpoint"""
-    try:
-        bot_info = bot.get_me()
-        stats = get_stats()
-        
-        return jsonify({
-            "status": "healthy",
-            "timestamp": datetime.now().isoformat(),
-            "url": KOYEB_URL,
-            "platform": "Koyeb Free Tier",
-            "bot": {
-                "username": bot_info.username,
-                "id": bot_info.id
-            },
-            "scheduler": {
-                "active": scheduler_active,
-                "messages_sent": message_count,
-                "last_message": last_message_time
-            },
-            "statistics": stats,
-            "uptime": get_uptime(),
-            "memory": "threading_apscheduler"
-        })
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e),
-            "timestamp": datetime.now().isoformat()
-        }), 500
+@app.route('/send_test')
+def web_send_test():
+    """Send test message via web"""
+    test_msg = f"""
+✅ <b>Test from Web Interface</b>
 
-@app.route('/send_now')
-def send_now():
-    """Send immediate message via web"""
-    try:
-        current_time = datetime.now().strftime('%H:%M:%S')
-        message = f"🚀 *Immediate Message from Web*\nTime: {current_time}\nURL: {KOYEB_URL}\nTrigger: Web Interface"
-        bot.send_message(USER_ID, message, parse_mode='Markdown')
-        
-        log_message(USER_ID, f"Web trigger: {current_time}", "outgoing")
-        log_activity("WEB", f"Manual message sent at {current_time}")
-        
-        return f"""
-        <!DOCTYPE html>
-        <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>body{{font-family:Arial;text-align:center;padding:50px;}}h1{{color:green;}}</style>
-        </head><body>
-        <h1>✅ Message Sent Successfully!</h1>
-        <p>Check your Telegram bot.</p>
-        <p>Total scheduled messages: {message_count}</p>
-        <p><a href="/" class="btn">← Back to Dashboard</a></p>
-        <script>setTimeout(()=>window.location.href='/',2000);</script>
-        </body></html>
-        """
-    except Exception as e:
-        return f"<h1>❌ Error: {e}</h1>"
+Time: {datetime.now().strftime('%H:%M:%S')}
+Interface: Web Browser
+Status: Working correctly!
+"""
+    if send_telegram_message(test_msg):
+        return "<h1>✅ Test message sent!</h1><p><a href='/'>← Back</a></p>"
+    else:
+        return "<h1>❌ Failed to send message</h1><p><a href='/'>← Back</a></p>"
 
-@app.route('/start_schedule')
-def start_schedule():
-    """Start the scheduler"""
-    global scheduler_active
-    scheduler_active = True
-    
-    # Start the scheduling thread if not already running
-    if not hasattr(app, 'scheduler_started') or not app.scheduler_started:
-        threading.Thread(target=send_scheduled_message, daemon=True).start()
-        app.scheduler_started = True
-        log_activity("SCHEDULER", "Scheduler thread started")
-    
-    bot.send_message(USER_ID, "✅ Scheduler activated! Messages every minute.")
+@app.route('/send_report')
+def web_send_report():
+    """Send report via web"""
+    send_hourly_report()
+    return "<h1>✅ Hourly report sent!</h1><p><a href='/'>← Back</a></p>"
+
+@app.route('/status')
+def web_status():
+    """Web status API"""
+    uptime = datetime.now() - app_start_time
     
     return jsonify({
-        "status": "started",
-        "message": "Scheduler activated",
-        "interval": "60 seconds",
+        "status": "online",
+        "monitor_active": monitor_active,
+        "uptime": str(uptime).split('.')[0],
+        "started": app_start_time.isoformat(),
+        "tasks": len(load_json_file(TASKS_FILE)),
+        "notes": len(load_json_file(NOTES_FILE)),
         "timestamp": datetime.now().isoformat()
     })
-
-@app.route('/stop_schedule')
-def stop_schedule():
-    """Stop the scheduler"""
-    global scheduler_active
-    scheduler_active = False
-    
-    bot.send_message(USER_ID, "⏸️ Scheduler paused. No more auto messages.")
-    
-    return jsonify({
-        "status": "stopped",
-        "message": "Scheduler paused",
-        "timestamp": datetime.now().isoformat()
-    })
-
-@app.route('/setup_webhook')
-def setup_webhook():
-    """Setup Telegram webhook"""
-    try:
-        webhook_url = f"https://{KOYEB_URL}/webhook"
-        bot.remove_webhook()
-        time.sleep(1)
-        bot.set_webhook(url=webhook_url)
-        
-        bot.send_message(USER_ID, f"✅ Webhook setup complete!\nURL: {webhook_url}")
-        log_activity("WEBHOOK", f"Webhook set to {webhook_url}")
-        
-        return f"""
-        <!DOCTYPE html>
-        <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>body{{font-family:Arial;text-align:center;padding:50px;}}h1{{color:green;}}</style>
-        </head><body>
-        <h1>✅ Webhook Setup Complete!</h1>
-        <p><strong>URL:</strong> {webhook_url}</p>
-        <p>Telegram will now send messages to this URL.</p>
-        <p><a href="/">← Back to Dashboard</a></p>
-        </body></html>
-        """
-    except Exception as e:
-        return f"<h1>❌ Error: {e}</h1>"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -583,234 +528,71 @@ def webhook():
             bot.process_new_updates([update])
             return 'OK', 200
         except Exception as e:
-            log_activity("WEBHOOK_ERROR", str(e))
             return 'Error', 500
     return 'Bad Request', 400
 
-@app.route('/admin')
-def admin_panel():
-    """Admin panel"""
-    password = request.args.get('password', '')
-    if password != ADMIN_PASSWORD:
-        return """
-        <!DOCTYPE html>
-        <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>body{font-family:Arial;text-align:center;padding:50px;}form{padding:20px;}</style>
-        </head><body>
-        <h1>🔐 Admin Login</h1>
-        <form method="GET">
-            <input type="password" name="password" placeholder="Enter admin password" style="padding:10px;font-size:16px;width:300px;">
-            <button type="submit" style="padding:10px 20px;font-size:16px;background:#667eea;color:white;border:none;border-radius:5px;">Login</button>
-        </form>
-        <p>Default password: admin123</p>
-        </body></html>
-        """
-    
-    stats = get_stats()
-    recent_logs = get_recent_logs(20)
-    
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body {{ font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5; }}
-            .container {{ max-width: 1200px; margin: 0 auto; }}
-            .card {{ background: white; padding: 20px; margin: 20px 0; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-            table {{ width: 100%; border-collapse: collapse; }}
-            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
-            th {{ background-color: #f2f2f2; }}
-            .btn {{ display: inline-block; padding: 10px 20px; background: #667eea; color: white; text-decoration: none; border-radius: 5px; margin: 5px; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>🔐 Admin Panel</h1>
-            <a href="/" class="btn">← Dashboard</a>
-            
-            <div class="card">
-                <h2>📊 System Information</h2>
-                <p><strong>URL:</strong> {KOYEB_URL}</p>
-                <p><strong>Bot Token:</strong> {BOT_TOKEN[:15]}...</p>
-                <p><strong>User ID:</strong> {USER_ID}</p>
-                <p><strong>Password:</strong> {ADMIN_PASSWORD}</p>
-                <p><strong>Webhook:</strong> https://{KOYEB_URL}/webhook</p>
-                <p><strong>Uptime:</strong> {get_uptime()}</p>
-            </div>
-            
-            <div class="card">
-                <h2>📈 Statistics</h2>
-                <table>
-                    <tr><th>Metric</th><th>Value</th></tr>
-                    <tr><td>Outgoing Messages</td><td>{stats['outgoing_messages']}</td></tr>
-                    <tr><td>Incoming Messages</td><td>{stats['incoming_messages']}</td></tr>
-                    <tr><td>Scheduled Count</td><td>{message_count}</td></tr>
-                    <tr><td>Log Entries</td><td>{stats['total_logs']}</td></tr>
-                    <tr><td>Scheduler Status</td><td>{'✅ Active' if scheduler_active else '⏸️ Paused'}</td></tr>
-                    <tr><td>Last Message</td><td>{last_message_time or 'None'}</td></tr>
-                </table>
-            </div>
-            
-            <div class="card">
-                <h2>📝 Recent Logs</h2>
-                <pre style="background: #f8f9fa; padding: 15px; border-radius: 5px; overflow-x: auto;">
-{recent_logs}
-                </pre>
-            </div>
-            
-            <div class="card">
-                <h2>⚡ Admin Actions</h2>
-                <a href="/send_now" class="btn">Send Test Message</a>
-                <a href="/start_schedule" class="btn">Start Schedule</a>
-                <a href="/stop_schedule" class="btn">Stop Schedule</a>
-                <a href="/setup_webhook" class="btn">Setup Webhook</a>
-                <a href="/ping" class="btn">Ping Self</a>
-                <a href="/health" class="btn">Health Check</a>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-
-@app.route('/ping')
-def ping():
-    """Keep-alive ping endpoint"""
-    log_activity("PING", "Keep-alive ping received")
-    return jsonify({
-        "status": "pong",
-        "timestamp": datetime.now().isoformat(),
-        "url": KOYEB_URL,
-        "scheduler": scheduler_active
-    })
-
-# ============= HELPER FUNCTIONS =============
-def get_uptime():
-    """Calculate uptime"""
-    delta = datetime.now() - app_start_time
-    days = delta.days
-    hours, remainder = divmod(delta.seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    
-    if days > 0:
-        return f"{days}d {hours}h {minutes}m"
-    elif hours > 0:
-        return f"{hours}h {minutes}m {seconds}s"
-    else:
-        return f"{minutes}m {seconds}s"
-
-def get_recent_logs(limit=10):
-    """Get recent logs from database"""
-    try:
-        conn = sqlite3.connect('/tmp/bot_data.db')
-        c = conn.cursor()
-        c.execute("SELECT timestamp, type, message FROM bot_logs ORDER BY timestamp DESC LIMIT ?", (limit,))
-        logs = c.fetchall()
-        conn.close()
-        
-        result = ""
-        for log in logs:
-            result += f"{log[0]} [{log[1]}] {log[2]}\n"
-        return result if result else "No logs yet"
-    except:
-        return "Logs unavailable"
-
-# ============= KEEP-ALIVE MECHANISM =============
-def ping_self():
-    """Ping the app to keep it awake"""
-    try:
-        response = requests.get(f"https://{KOYEB_URL}/ping", timeout=10)
-        log_activity("KEEPALIVE", f"Self-ping successful: {response.status_code}")
-    except Exception as e:
-        log_activity("KEEPALIVE_ERROR", f"Self-ping failed: {str(e)}")
-
 # ============= INITIALIZATION =============
 def initialize():
-    """Initialize the application"""
-    print("=" * 70)
-    print("🤖 TELEGRAM BOT FOR KOYEB FREE TIER - INITIALIZING")
-    print("=" * 70)
-    
-    # Initialize database
-    init_db()
+    """Initialize the bot"""
+    print("=" * 60)
+    print("🤖 Task Tracker Bot - Initializing")
+    print("=" * 60)
     
     try:
         # Get bot info
         bot_info = bot.get_me()
         print(f"✅ Bot: @{bot_info.username} (ID: {bot_info.id})")
         
-        # Setup webhook
-        webhook_url = f"https://{KOYEB_URL}/webhook"
-        bot.remove_webhook()
-        time.sleep(1)
-        bot.set_webhook(url=webhook_url)
-        print(f"✅ Webhook set to: {webhook_url}")
-        
-        # Setup APScheduler for keep-alive
-        keepalive_scheduler.add_job(ping_self, 'interval', minutes=5)
-        keepalive_scheduler.start()
-        print("✅ APScheduler started (keep-alive every 5 minutes)")
+        # Start monitoring thread
+        monitor_thread = threading.Thread(target=monitoring_loop, daemon=True)
+        monitor_thread.start()
+        print("✅ Monitoring thread started")
         
         # Send startup message
         startup_msg = f"""
-🚀 *Bot Started on Koyeb Free Tier!*
+🚀 <b>Task Tracker Bot Started</b>
 
-*URL:* {KOYEB_URL}
-*Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-*Bot:* @{bot_info.username}
-*Status:* ✅ Active and Running
-*Features:* 
-• Scheduled messages every minute
-• No background workers needed
-• Threading + APScheduler
-• Web admin panel
-• Database logging
+✅ <b>Bot is online!</b>
+🤖 @{bot_info.username}
+⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-Enjoy your bot! 🤖
+<b>Features activated:</b>
+• Task reminders (10 minutes before start)
+• Note reminders (custom intervals)
+• Hourly status reports (24x per day)
+
+Send /help for commands.
 """
-        bot.send_message(USER_ID, startup_msg, parse_mode='Markdown')
-        
-        # Start scheduler thread
-        threading.Thread(target=send_scheduled_message, daemon=True).start()
-        app.scheduler_started = True
-        global scheduler_active
-        scheduler_active = True
-        
-        print("✅ Scheduler thread started (messages every minute)")
+        send_telegram_message(startup_msg)
         print("✅ Startup message sent")
-        print("✅ Database initialized")
-        
-        log_activity("SYSTEM", "Application initialized successfully")
         
     except Exception as e:
         print(f"❌ Initialization error: {e}")
-        log_activity("ERROR", f"Initialization failed: {str(e)}")
     
-    print("=" * 70)
-    print(f"🌐 Access your bot at: https://{KOYEB_URL}")
-    print(f"🔐 Admin panel: https://{KOYEB_URL}/admin?password={ADMIN_PASSWORD}")
-    print("=" * 70)
-
-# ============= SHUTDOWN HANDLER =============
-def shutdown_handler():
-    """Handle application shutdown"""
-    log_activity("SYSTEM", "Application shutting down")
-    keepalive_scheduler.shutdown()
-    print("🛑 Application shutdown complete")
-
-# Register shutdown handler
-atexit.register(shutdown_handler)
+    print("=" * 60)
+    print("✅ Bot initialized successfully")
+    print("=" * 60)
 
 # ============= MAIN =============
 if __name__ == '__main__':
-    # Initialize application
+    # Initialize bot
     initialize()
     
     # Start Flask app
     port = int(os.getenv('PORT', 8000))
     print(f"🌐 Starting web server on port {port}...")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    
+    # Use polling for development, webhook for production
+    try:
+        # Start polling in separate thread
+        polling_thread = threading.Thread(target=bot.polling, kwargs={'none_stop': True, 'interval': 1}, daemon=True)
+        polling_thread.start()
+        print("✅ Telegram polling started")
+    except:
+        print("⚠️ Could not start polling, using webhook only")
+    
+    # Run Flask app
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 else:
-    # For Gunicorn
+    # For production deployment
     initialize()

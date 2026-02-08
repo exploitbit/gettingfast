@@ -8,9 +8,18 @@
       "time": "11:13 PM",
       "type": "task",
       "source": "telegram"
+    },
+    {
+      "id": 2,
+      "text": "Commands:\n• /add - Add a new task\n• /tasks - View your tasks\n• /download - Download JSON data\n• /clear - Clear all data\n\nHow to use:\n1. Send any message - it will be saved\n2. View data on web interface\n3. Download JSON anytime\n\nStorage:\n✅ GitHub Repository\n📁 Local backup\n\n\nFir se pcm me know if you want to make it like this 😀😀 h kya hai na bhiyaan ye to Fir se pcm me know if you want to make it like",
+      "timestamp": "2026-02-08 23:13:37",
+      "date": "February 08, 2026",
+      "time": "11:13 PM",
+      "type": "task",
+      "source": "telegram"
     }
   ],
   "messages": [],
   "notes": [],
-  "last_id": 1
+  "last_id": 2
 }

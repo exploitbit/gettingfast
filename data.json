@@ -53,9 +53,18 @@
       "time": "12:26 AM",
       "type": "task",
       "source": "telegram"
+    },
+    {
+      "id": 7,
+      "text": "\"\nInstance is stopping.",
+      "timestamp": "2026-02-09 00:26:41",
+      "date": "February 09, 2026",
+      "time": "12:26 AM",
+      "type": "task",
+      "source": "telegram"
     }
   ],
   "messages": [],
   "notes": [],
-  "last_id": 6
+  "last_id": 7
 }

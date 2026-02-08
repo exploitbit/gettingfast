@@ -4,10 +4,10 @@
     "title": "Hello",
     "description": "🤖 GitHub Task Tracker\r\nData saved to GitHub repository\r\n\r\nCommands:\r\n• /add - Add a new task\r\n• /tasks - View your tasks\r\n• /download - Download JSON data\r\n• /clear - Clear all data\r\n\r\nHow to use:\r\n1. Send any message - it will be saved\r\n2. View data on web interface\r\n3. Download JSON anytime\r\n\r\nStorage:\r\n✅ GitHub Repository\r\n📁 Local backup",
     "priority": 1,
-    "notify_enabled": 0,
-    "notify_interval": 12,
+    "notify_enabled": 1,
+    "notify_interval": 1,
     "last_notified": null,
     "created_at": "2026-02-09 01:42:30",
-    "updated_at": "2026-02-09 01:42:30"
+    "updated_at": "2026-02-09 01:43:28"
   }
 ]

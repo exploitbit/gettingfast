@@ -9,11 +9,13 @@ import threading
 import json
 from datetime import datetime, timedelta
 import pytz
-from flask import Flask, request, Response, render_template_string, jsonify, session, redirect, url_for
+from flask import Flask, request, Response, render_template_string, jsonify, session, redirect, url_for, send_file
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 import time
 import secrets
+import io
+import csv
 
 # ============= CONFIGURATION =============
 BOT_TOKEN = "8388773187:AAFxz5U8GJ94Wf21VaGvFx9QQSZFU2Rd43I"
@@ -137,6 +139,7 @@ def init_db():
     
     conn.commit()
     conn.close()
+    print("✅ Database initialized successfully")
 
 init_db()
 
@@ -151,20 +154,29 @@ def db_query(query, params=(), fetch_one=False, fetch_all=False):
     """Execute database query"""
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute(query, params)
     
-    if query.strip().upper().startswith('SELECT'):
-        if fetch_one:
-            result = cursor.fetchone()
-        elif fetch_all:
-            result = cursor.fetchall()
+    try:
+        cursor.execute(query, params)
+        
+        if query.strip().upper().startswith('SELECT'):
+            if fetch_one:
+                result = cursor.fetchone()
+            elif fetch_all:
+                result = cursor.fetchall()
+            else:
+                result = cursor.fetchall()
         else:
-            result = cursor.fetchall()
-    else:
-        conn.commit()
-        result = cursor.lastrowid
+            conn.commit()
+            result = cursor.lastrowid
+    except Exception as e:
+        print(f"❌ Database query error: {e}")
+        print(f"Query: {query}")
+        print(f"Params: {params}")
+        conn.rollback()
+        result = None
+    finally:
+        conn.close()
     
-    conn.close()
     return result
 
 def row_to_dict(row):
@@ -172,37 +184,6 @@ def row_to_dict(row):
     if row is None:
         return None
     return dict(row)
-
-
-# ============= FAKE JSON DATA GENERATOR =============
-
-FAKE_JSON_FILE = "fake_users.json"
-
-def generate_fake_json():
-    names = [
-        "Jejeje","Dvvb","Dvb","Dhjj","Dggg","Dggh","Djkkvvv","Rvvc",
-        "Tgcvkj","Tjgg","Tvvj","Thhhjjjj","Tybh","Ybbb","Thhh",
-        "Tbbbb","Rhhrj","Ynnn","Ybbn"
-    ]
-
-    fake_data = []
-    now = datetime.now(IST)
-
-    for i, name in enumerate(names, start=1):
-        fake_data.append({
-            "id": i,
-            "name": name,
-            "username": f"{name.lower()}_{secrets.randbelow(9999)}",
-            "email": f"{name.lower()}@example.com",
-            "created_at": (now - timedelta(days=secrets.randbelow(30))).strftime("%Y-%m-%d %H:%M:%S"),
-            "status": "active"
-        })
-
-    with open(FAKE_JSON_FILE, "w", encoding="utf-8") as f:
-        json.dump(fake_data, f, indent=4)
-
-    print(f"[+] Fake JSON data saved to {FAKE_JSON_FILE}")
-    
 
 # ============= TIME FUNCTIONS =============
 def get_ist_time():
@@ -212,8 +193,16 @@ def get_ist_time():
 def format_ist_time(dt, format_str='%Y-%m-%d %H:%M:%S'):
     """Format datetime in IST"""
     if isinstance(dt, str):
-        dt = datetime.strptime(dt, '%Y-%m-%d %H:%M:%S')
-        dt = IST.localize(dt)
+        try:
+            dt = datetime.strptime(dt, '%Y-%m-%d %H:%M:%S')
+            dt = IST.localize(dt)
+        except ValueError:
+            try:
+                dt = datetime.strptime(dt, '%Y-%m-%d %H:%M')
+                dt = IST.localize(dt)
+            except ValueError as e:
+                print(f"❌ Time parsing error: {e}")
+                return dt
     return dt.strftime(format_str)
 
 def parse_ist_time(time_str, date_str=None):
@@ -221,8 +210,13 @@ def parse_ist_time(time_str, date_str=None):
     if date_str is None:
         date_str = get_ist_time().strftime('%Y-%m-%d')
     
-    naive_dt = datetime.strptime(f"{date_str} {time_str}", '%Y-%m-%d %H:%M')
-    return IST.localize(naive_dt)
+    try:
+        naive_dt = datetime.strptime(f"{date_str} {time_str}", '%Y-%m-%d %H:%M')
+        return IST.localize(naive_dt)
+    except ValueError:
+        # Try with seconds
+        naive_dt = datetime.strptime(f"{date_str} {time_str}", '%Y-%m-%d %H:%M:%S')
+        return IST.localize(naive_dt)
 
 # ============= TELEGRAM FUNCTIONS =============
 def send_telegram_message(text, chat_id=USER_ID):
@@ -249,6 +243,7 @@ def check_and_send_notifications():
     """Check and send notifications for tasks starting in 10 minutes"""
     try:
         now = get_ist_time()
+        today = now.strftime('%Y-%m-%d')
         print(f"⏰ Notification check at {now.strftime('%H:%M:%S')} IST")
         
         # Get active tasks with notifications enabled
@@ -256,11 +251,11 @@ def check_and_send_notifications():
             SELECT * FROM tasks 
             WHERE completed = 0 
             AND notify_enabled = 1
-            AND datetime(start_time) > datetime('now', '-1 hour')
+            AND date(start_time) = ?
             ORDER BY start_time
-        ''', fetch_all=True)
+        ''', (today,), fetch_all=True)
         
-        print(f"📋 Found {len(tasks)} active tasks")
+        print(f"📋 Found {len(tasks)} active tasks for today")
         
         for task_row in tasks:
             try:
@@ -270,7 +265,13 @@ def check_and_send_notifications():
                     
                 task_id = task['id']
                 task_title = task['title']
-                start_time = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
+                
+                # Parse start time
+                start_time_str = task['start_time']
+                if '.' in start_time_str:
+                    start_time_str = start_time_str.split('.')[0]
+                
+                start_time = datetime.strptime(start_time_str, '%Y-%m-%d %H:%M:%S')
                 start_time = IST.localize(start_time)
                 
                 # Calculate minutes until task starts
@@ -284,7 +285,9 @@ def check_and_send_notifications():
                     
                     # Only send if we haven't notified for this specific minute
                     if last_notified != minutes_until_start:
-                        message = f"⏰ <b>Task Reminder</b>\n"
+                        message = "━━━━━━━━━━━━━━━━━━━━\n"
+                        message += f"⏰ <b>Task Reminder</b>\n"
+                        message += "━━━━━━━━━━━━━━━━━━━━\n\n"
                         message += f"📝 <b>{task_title}</b>\n"
                         message += f"🕐 Starts in {minutes_until_start} minute"
                         if minutes_until_start > 1:
@@ -309,7 +312,9 @@ def check_and_send_notifications():
                     print(f"   🔄 Reset notifications for task {task_id}")
                     
             except Exception as e:
-                print(f"   ❌ Error with task: {e}")
+                print(f"   ❌ Error with task {task.get('id', 'unknown')}: {e}")
+                import traceback
+                traceback.print_exc()
         
     except Exception as e:
         print(f"❌ Notification system error: {e}")
@@ -337,7 +342,7 @@ def send_half_hourly_report():
         if not tasks:
             message = "━━━━━━━━━━━━━━━━━━━━\n"
             message += "📊 <b>30-Minute Report</b>\n"
-            message += "━━━━━━━━━━━━━━━━━━━━\n"
+            message += "━━━━━━━━━━━━━━━━━━━━\n\n"
             message += f"🕐 Time: {now.strftime('%I:%M %p')} IST\n"
             message += f"📅 Date: {now.strftime('%B %d, %Y')}\n"
             message += "✅ <i>No active tasks for today!</i>"
@@ -347,7 +352,7 @@ def send_half_hourly_report():
             
             message = "━━━━━━━━━━━━━━━━━━━━\n"
             message += "📊 <b>30-Minute Report</b>\n"
-            message += "━━━━━━━━━━━━━━━━━━━━\n"
+            message += "━━━━━━━━━━━━━━━━━━━━\n\n"
             message += f"🕐 Time: {now.strftime('%I:%M %p')} IST\n"
             message += f"📅 Date: {now.strftime('%B %d, %Y')}\n"
             message += f"📋 Tasks: {completed}/{total} completed\n\n"
@@ -403,7 +408,7 @@ def check_note_notifications():
             if should_notify:
                 message = "━━━━━━━━━━━━━━━━━━━━\n"
                 message += f"📝 <b>Note Reminder</b>\n"
-                message += "━━━━━━━━━━━━━━━━━━━━\n"
+                message += "━━━━━━━━━━━━━━━━━━━━\n\n"
                 message += f"📌 <b>{note['title']}</b>\n"
                 message += f"🔄 Interval: Every {interval_hours} hours\n"
                 message += f"⏰ Time: {now.strftime('%I:%M %p')} IST\n"
@@ -472,7 +477,7 @@ def send_welcome(message):
         InlineKeyboardButton("📋 Today's Tasks", callback_data='today_tasks'),
         InlineKeyboardButton("📊 Summary", callback_data='summary'),
         InlineKeyboardButton("⏰ Current Time", callback_data='current_time'),
-        InlineKeyboardButton("🔄 Test", callback_data='test_notification'),
+        InlineKeyboardButton("📥 Download Data", callback_data='download_data'),
         InlineKeyboardButton("🌐 Open Web App", web_app=WebAppInfo(url=f"https://patient-maxie-sandip232-786edcb8.koyeb.app/")),
         InlineKeyboardButton("🔙 Back", callback_data='back_to_main')
     )
@@ -525,8 +530,8 @@ def handle_callback_query(call):
         send_daily_summary_callback(chat_id, message_id)
     elif call.data == 'current_time':
         send_current_time_callback(chat_id, message_id)
-    elif call.data == 'test_notification':
-        send_test_notification_callback(chat_id, message_id)
+    elif call.data == 'download_data':
+        send_download_data_callback(chat_id)
     elif call.data == 'back_to_main':
         bot.delete_message(chat_id, message_id)
         send_welcome(call.message)
@@ -608,25 +613,20 @@ def send_current_time_callback(chat_id):
     
     bot.send_message(chat_id, time_msg, parse_mode='HTML', reply_markup=keyboard)
 
-def send_test_notification_callback(chat_id):
-    """Send test notification via callback"""
-    now = get_ist_time()
+def send_download_data_callback(chat_id):
+    """Send database data download link"""
+    message = "📥 <b>Database Download</b>\n\n"
+    message += "You can download your database data from the web interface:\n"
+    message += "1. Go to the web app\n"
+    message += "2. Click on Settings\n"
+    message += "3. Click 'Export Database'\n\n"
+    message += "Or use this direct link:\n"
+    message += f"https://patient-maxie-sandip232-786edcb8.koyeb.app/export_db"
     
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("🔙 Back", callback_data='back_to_main'))
     
-    test_msg = "━━━━━━━━━━━━━━━━━━━━\n"
-    test_msg += "🔔 <b>Test Notification</b>\n"
-    test_msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
-    test_msg += "✅ <b>Bot is working perfectly!</b>\n"
-    test_msg += f"⏰ Time: {now.strftime('%H:%M:%S')} IST\n"
-    test_msg += f"📅 Date: {now.strftime('%B %d, %Y')}\n\n"
-    test_msg += "<i>All systems operational! 🚀</i>"
-    
-    if send_telegram_message(test_msg, chat_id):
-        bot.send_message(chat_id, "✅ <b>Test notification sent successfully!</b>", parse_mode='HTML', reply_markup=keyboard)
-    else:
-        bot.send_message(chat_id, "❌ <b>Failed to send test notification</b>", parse_mode='HTML', reply_markup=keyboard)
+    bot.send_message(chat_id, message, parse_mode='HTML', reply_markup=keyboard)
 
 @bot.message_handler(commands=['today'])
 def send_today_tasks(message):
@@ -772,21 +772,36 @@ def calculate_time_status(start_time, end_time, is_active, completed):
         return {
             'text': 'Completed',
             'status': 'completed',
-            'class': 'upcoming'
+            'class': 'completed'
         }
     
     if not is_active:
         return {
             'text': 'Inactive',
             'status': 'inactive',
-            'class': 'upcoming'
+            'class': 'inactive'
         }
     
     now = get_ist_time()
-    start_dt = datetime.strptime(start_time, '%Y-%m-%d %H:%M:%S')
-    start_dt = IST.localize(start_dt)
-    end_dt = datetime.strptime(end_time, '%Y-%m-%d %H:%M:%S')
-    end_dt = IST.localize(end_dt)
+    
+    # Parse times
+    try:
+        if '.' in start_time:
+            start_time = start_time.split('.')[0]
+        if '.' in end_time:
+            end_time = end_time.split('.')[0]
+            
+        start_dt = datetime.strptime(start_time, '%Y-%m-%d %H:%M:%S')
+        start_dt = IST.localize(start_dt)
+        end_dt = datetime.strptime(end_time, '%Y-%m-%d %H:%M:%S')
+        end_dt = IST.localize(end_dt)
+    except Exception as e:
+        print(f"❌ Time parsing error in calculate_time_status: {e}")
+        return {
+            'text': 'Error',
+            'status': 'error',
+            'class': 'error'
+        }
     
     # Convert to minutes for easier comparison
     current_minutes = now.hour * 60 + now.minute
@@ -880,12 +895,27 @@ def index():
     now = get_ist_time()
     today = now.strftime('%Y-%m-%d')
     
-    # Get tasks for today
+    print(f"🔍 DEBUG: Loading index for view: {view}")
+    print(f"🔍 DEBUG: Today's date: {today}")
+    
+    # Get ALL tasks (not just today's) for debugging
+    all_tasks_raw = db_query('SELECT * FROM tasks ORDER BY start_time', fetch_all=True)
+    print(f"🔍 DEBUG: Total tasks in database: {len(all_tasks_raw) if all_tasks_raw else 0}")
+    
+    # Show ALL tasks regardless of date for now
     tasks = db_query('''
         SELECT * FROM tasks 
-        WHERE date(start_time) = ?
+        WHERE completed = 0
         ORDER BY start_time
-    ''', (today,), fetch_all=True)
+    ''', fetch_all=True)
+    
+    print(f"🔍 DEBUG: Active tasks (not completed): {len(tasks) if tasks else 0}")
+    
+    if tasks:
+        for task in tasks[:3]:  # Print first 3 tasks for debugging
+            task_dict = row_to_dict(task)
+            if task_dict:
+                print(f"🔍 DEBUG Task: ID={task_dict.get('id')}, Title='{task_dict.get('title')}', Start='{task_dict.get('start_time')}', Completed={task_dict.get('completed')}")
     
     # Get all tasks for stats
     all_tasks = db_query('SELECT * FROM tasks', fetch_all=True)
@@ -922,87 +952,131 @@ def index():
             settings[row_dict['key']] = row_dict['value']
     
     # Calculate stats
-    completed_today = sum(1 for t in tasks if t['completed'])
-    pending_today = len(tasks) - completed_today
+    completed_tasks = db_query('SELECT COUNT(*) as count FROM tasks WHERE completed = 1', fetch_one=True)
+    pending_tasks = db_query('SELECT COUNT(*) as count FROM tasks WHERE completed = 0', fetch_one=True)
+    
+    completed_today = completed_tasks['count'] if completed_tasks else 0
+    pending_today = pending_tasks['count'] if pending_tasks else 0
     
     # Process tasks for display
     processed_tasks = []
-    for task in tasks:
-        task_dict = row_to_dict(task)
-        if not task_dict:
-            continue
+    if tasks:
+        for task in tasks:
+            task_dict = row_to_dict(task)
+            if not task_dict:
+                continue
+                
+            # Get subtasks
+            subtasks = db_query('''
+                SELECT * FROM subtasks 
+                WHERE task_id = ?
+                ORDER BY priority
+            ''', (task_dict['id'],), fetch_all=True)
             
-        # Get subtasks
-        subtasks = db_query('''
-            SELECT * FROM subtasks 
-            WHERE task_id = ?
-            ORDER BY priority
-        ''', (task_dict['id'],), fetch_all=True)
-        
-        completed_subtasks = sum(1 for st in subtasks if st['completed'])
-        total_subtasks = len(subtasks)
-        progress_percentage = round((completed_subtasks / total_subtasks * 100)) if total_subtasks > 0 else 0
-        
-        # Format times
-        start_dt = datetime.strptime(task_dict['start_time'], '%Y-%m-%d %H:%M:%S')
-        start_dt = IST.localize(start_dt)
-        end_dt = datetime.strptime(task_dict['end_time'], '%Y-%m-%d %H:%M:%S')
-        end_dt = IST.localize(end_dt)
-        
-        # Calculate time status
-        time_info = calculate_time_status(
-            task_dict['start_time'],
-            task_dict['end_time'],
-            not task_dict['completed'],
-            task_dict['completed']
-        )
-        
-        processed_tasks.append({
-            'id': task_dict['id'],
-            'title': task_dict['title'],
-            'description': task_dict['description'],
-            'start_time': task_dict['start_time'],
-            'end_time': task_dict['end_time'],
-            'start_display': start_dt.strftime('%I:%M %p'),
-            'end_display': end_dt.strftime('%I:%M %p'),
-            'date_range': start_dt.strftime('%b %d'),
-            'time_range': f"{start_dt.strftime('%I:%M %p')} - {end_dt.strftime('%I:%M %p')}",
-            'completed': task_dict['completed'],
-            'notify_enabled': task_dict['notify_enabled'],
-            'priority': task_dict['priority'],
-            'repeat': task_dict['repeat'],
-            'repeat_day': task_dict['repeat_day'],
-            'subtasks': [row_to_dict(st) for st in subtasks],
-            'completed_subtasks': completed_subtasks,
-            'total_subtasks': total_subtasks,
-            'progress_percentage': progress_percentage,
-            'time_status': time_info,
-            'is_active': not task_dict['completed'],
-            'is_completed_repeating': task_dict['repeat'] != 'none' and task_dict['completed']
-        })
+            completed_subtasks = sum(1 for st in subtasks if st['completed'])
+            total_subtasks = len(subtasks)
+            progress_percentage = round((completed_subtasks / total_subtasks * 100)) if total_subtasks > 0 else 0
+            
+            # Format times
+            try:
+                start_time_str = task_dict['start_time']
+                end_time_str = task_dict['end_time']
+                
+                if '.' in start_time_str:
+                    start_time_str = start_time_str.split('.')[0]
+                if '.' in end_time_str:
+                    end_time_str = end_time_str.split('.')[0]
+                    
+                start_dt = datetime.strptime(start_time_str, '%Y-%m-%d %H:%M:%S')
+                start_dt = IST.localize(start_dt)
+                end_dt = datetime.strptime(end_time_str, '%Y-%m-%d %H:%M:%S')
+                end_dt = IST.localize(end_dt)
+                
+                # Calculate time status
+                time_info = calculate_time_status(
+                    start_time_str,
+                    end_time_str,
+                    not task_dict['completed'],
+                    task_dict['completed']
+                )
+                
+                processed_tasks.append({
+                    'id': task_dict['id'],
+                    'title': task_dict['title'],
+                    'description': task_dict['description'],
+                    'start_time': start_time_str,
+                    'end_time': end_time_str,
+                    'start_display': start_dt.strftime('%I:%M %p'),
+                    'end_display': end_dt.strftime('%I:%M %p'),
+                    'date_display': start_dt.strftime('%b %d'),
+                    'time_range': f"{start_dt.strftime('%I:%M %p')} - {end_dt.strftime('%I:%M %p')}",
+                    'completed': task_dict['completed'],
+                    'notify_enabled': task_dict['notify_enabled'],
+                    'priority': task_dict['priority'],
+                    'repeat': task_dict['repeat'],
+                    'repeat_day': task_dict['repeat_day'],
+                    'subtasks': [row_to_dict(st) for st in subtasks],
+                    'completed_subtasks': completed_subtasks,
+                    'total_subtasks': total_subtasks,
+                    'progress_percentage': progress_percentage,
+                    'time_status': time_info,
+                    'is_active': not task_dict['completed'],
+                    'is_completed_repeating': task_dict['repeat'] != 'none' and task_dict['completed']
+                })
+            except Exception as e:
+                print(f"❌ Error processing task {task_dict.get('id')}: {e}")
+                # Add task with minimal info
+                processed_tasks.append({
+                    'id': task_dict['id'],
+                    'title': task_dict['title'],
+                    'description': task_dict['description'],
+                    'start_time': task_dict['start_time'],
+                    'end_time': task_dict['end_time'],
+                    'start_display': 'Error',
+                    'end_display': 'Error',
+                    'date_display': 'Error',
+                    'time_range': 'Time parsing error',
+                    'completed': task_dict['completed'],
+                    'notify_enabled': task_dict['notify_enabled'],
+                    'priority': task_dict['priority'],
+                    'repeat': task_dict['repeat'],
+                    'repeat_day': task_dict['repeat_day'],
+                    'subtasks': [],
+                    'completed_subtasks': 0,
+                    'total_subtasks': 0,
+                    'progress_percentage': 0,
+                    'time_status': {'text': 'Error', 'status': 'error', 'class': 'error'},
+                    'is_active': not task_dict['completed'],
+                    'is_completed_repeating': task_dict['repeat'] != 'none' and task_dict['completed']
+                })
+    
+    print(f"🔍 DEBUG: Processed tasks for display: {len(processed_tasks)}")
     
     # Process notes for display
     processed_notes = []
     for note in notes:
         note_dict = row_to_dict(note)
         if note_dict:
-            created_at = datetime.strptime(note_dict['created_at'], '%Y-%m-%d %H:%M:%S')
-            created_at = IST.localize(created_at)
-            updated_at = datetime.strptime(note_dict['updated_at'], '%Y-%m-%d %H:%M:%S')
-            updated_at = IST.localize(updated_at)
-            
-            processed_notes.append({
-                'id': note_dict['id'],
-                'title': note_dict['title'],
-                'description': note_dict['description'],
-                'priority': note_dict['priority'],
-                'created_at': note_dict['created_at'],
-                'updated_at': note_dict['updated_at'],
-                'created_display': created_at.strftime('%b %d, %Y'),
-                'updated_display': updated_at.strftime('%b %d, %Y'),
-                'notify_enabled': note_dict['notify_enabled'],
-                'notify_interval': note_dict['notify_interval']
-            })
+            try:
+                created_at = datetime.strptime(note_dict['created_at'], '%Y-%m-%d %H:%M:%S')
+                created_at = IST.localize(created_at)
+                updated_at = datetime.strptime(note_dict['updated_at'], '%Y-%m-%d %H:%M:%S')
+                updated_at = IST.localize(updated_at)
+                
+                processed_notes.append({
+                    'id': note_dict['id'],
+                    'title': note_dict['title'],
+                    'description': note_dict['description'],
+                    'priority': note_dict['priority'],
+                    'created_at': note_dict['created_at'],
+                    'updated_at': note_dict['updated_at'],
+                    'created_display': created_at.strftime('%b %d, %Y'),
+                    'updated_display': updated_at.strftime('%b %d, %Y'),
+                    'notify_enabled': note_dict['notify_enabled'],
+                    'notify_interval': note_dict['notify_interval']
+                })
+            except Exception as e:
+                print(f"❌ Error processing note: {e}")
     
     # Render the HTML template
     return render_template_string('''
@@ -1170,25 +1244,25 @@ def index():
                 position: relative;
             }
             
-            .task-card.completed-repeating {
+            .task-card.completed {
                 background-color: var(--completed-bg);
                 opacity: 0.8;
             }
             
-            .task-card.completed-repeating .task-title,
-            .task-card.completed-repeating .task-description,
-            .task-card.completed-repeating .task-date-range,
-            .task-card.completed-repeating .task-time-range,
-            .task-card.completed-repeating .repeat-badge,
-            .task-card.completed-repeating .priority-badge {
+            .task-card.completed .task-title,
+            .task-card.completed .task-description,
+            .task-card.completed .task-date-range,
+            .task-card.completed .task-time-range,
+            .task-card.completed .repeat-badge,
+            .task-card.completed .priority-badge {
                 color: var(--completed-text);
             }
             
-            .task-card.completed-repeating .action-btn {
+            .task-card.completed .action-btn {
                 background-color: var(--completed-text);
             }
             
-            .task-card.completed-repeating .action-btn:hover {
+            .task-card.completed .action-btn:hover {
                 background-color: var(--completed-text);
                 transform: scale(1);
             }
@@ -1577,7 +1651,8 @@ def index():
             .time-remaining-badge.active { background-color: rgba(76, 201, 240, 0.2); color: var(--success); }
             .time-remaining-badge.due { background-color: rgba(248, 150, 30, 0.1); color: var(--warning); }
             .time-remaining-badge.overdue { background-color: rgba(247, 37, 133, 0.1); color: var(--danger); }
-            .time-remaining-badge.expired { background-color: rgba(108, 117, 125, 0.2); color: var(--gray); }
+            .time-remaining-badge.completed { background-color: rgba(108, 117, 125, 0.2); color: var(--gray); }
+            .time-remaining-badge.error { background-color: rgba(247, 37, 133, 0.1); color: var(--danger); }
             
             @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
             @keyframes scaleIn { from { opacity: 0; transform: scale(0.9); } to { opacity: 1; transform: scale(1); } }
@@ -1588,6 +1663,41 @@ def index():
                 .notes-container { grid-template-columns: 1fr; }
                 .task-description, .history-card-description { font-size: 0.75rem; }
                 .task-card { min-height: 120px !important; }
+            }
+            
+            .debug-info {
+                background-color: rgba(255, 193, 7, 0.1);
+                border: 1px solid rgba(255, 193, 7, 0.3);
+                border-radius: 8px;
+                padding: 12px;
+                margin: 16px 0;
+                font-size: 0.8rem;
+                color: var(--dark);
+            }
+            
+            .debug-info h4 {
+                margin-top: 0;
+                margin-bottom: 8px;
+                color: var(--warning);
+            }
+            
+            .export-btn {
+                display: inline-block;
+                background-color: var(--success);
+                color: white;
+                padding: 10px 20px;
+                border-radius: 6px;
+                text-decoration: none;
+                font-weight: 600;
+                transition: var(--transition);
+                border: none;
+                cursor: pointer;
+                font-size: 0.9rem;
+            }
+            
+            .export-btn:hover {
+                background-color: #3aa8c9;
+                transform: translateY(-2px);
             }
         </style>
     </head>
@@ -1629,12 +1739,25 @@ def index():
             <div class="view-content {{ 'active' if view == 'tasks' else '' }}" id="tasksView">
                 <div class="content-header">
                     <h1 class="page-title">Tasks</h1>
+                    <div style="font-size: 0.8rem; color: var(--gray);">
+                        {{ now.strftime('%I:%M %p') }} IST
+                    </div>
                 </div>
+                
+                {% if debug_mode %}
+                <div class="debug-info">
+                    <h4><i class="fas fa-bug"></i> Debug Information</h4>
+                    <div>Today's date: {{ today }}</div>
+                    <div>Total tasks in DB: {{ all_tasks|length }}</div>
+                    <div>Active tasks: {{ processed_tasks|length }}</div>
+                    <div>Completed tasks: {{ completed_today }}</div>
+                </div>
+                {% endif %}
                 
                 <div class="bucket-header">
                     <h2 class="bucket-title">
                         <i class="fas fa-tasks"></i>
-                        Active Tasks
+                        Active Tasks (Not Completed)
                         <span class="bucket-count">{{ processed_tasks|length }}</span>
                     </h2>
                 </div>
@@ -1643,11 +1766,14 @@ def index():
                     {% if not processed_tasks %}
                     <div class="empty-state" style="grid-column: 1 / -1;">
                         <i class="fas fa-clipboard-list"></i>
-                        <p>No tasks for today. Add a new one to get started!</p>
+                        <p>No active tasks found. Add a new one to get started!</p>
+                        <p style="font-size: 0.8rem; margin-top: 8px; color: var(--gray);">
+                            <i class="fas fa-info-circle"></i> Showing all tasks that are not marked as completed.
+                        </p>
                     </div>
                     {% else %}
                         {% for task in processed_tasks %}
-                        <div class="task-card {{ 'completed-repeating' if task.is_completed_repeating else '' }}">
+                        <div class="task-card {{ 'completed' if task.completed else '' }}">
                             <div class="task-header">
                                 <div style="flex: 1;">
                                     <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 4px;">
@@ -1659,10 +1785,10 @@ def index():
                                             <button class="action-btn" onclick="openEditTaskModal('{{ task.id }}')" title="Edit Task">
                                                 <i class="fas fa-edit"></i>
                                             </button>
-                                            {% if task.is_active %}
+                                            {% if not task.completed %}
                                             <form method="POST" action="/complete_task" style="display:inline;">
                                                 <input type="hidden" name="task_id" value="{{ task.id }}">
-                                                <button type="submit" class="action-btn" title="Complete">
+                                                <button type="submit" class="action-btn" title="Complete" onclick="return confirm('Mark this task as completed?')">
                                                     <i class="fas fa-check"></i>
                                                 </button>
                                             </form>
@@ -1681,7 +1807,7 @@ def index():
                                     </div>
                                     <div style="display: flex; justify-content: space-between; align-items: center;">
                                         <div>
-                                            <span class="task-date-range">{{ task.date_range }}</span>
+                                            <span class="task-date-range">{{ task.date_display }}</span>
                                             <span class="task-time-range">{{ task.time_range }}</span>
                                         </div>
                                         <div class="time-remaining-badge {{ task.time_status.class }}">
@@ -1997,9 +2123,43 @@ def index():
                     </div>
                     
                     <div class="settings-item">
+                        <span class="settings-label">Active Tasks</span>
+                        <span class="settings-value">{{ pending_today }}</span>
+                    </div>
+                    
+                    <div class="settings-item">
+                        <span class="settings-label">Completed Tasks</span>
+                        <span class="settings-value">{{ completed_today }}</span>
+                    </div>
+                    
+                    <div class="settings-item">
                         <span class="settings-label">Total Notes</span>
                         <span class="settings-value">{{ notes|length }}</span>
                     </div>
+                </div>
+                
+                <div class="settings-card">
+                    <h2 class="settings-title">
+                        <i class="fas fa-database"></i>
+                        Database Management
+                    </h2>
+                    
+                    <div class="settings-item">
+                        <span class="settings-label">Export Database</span>
+                        <a href="/export_db" class="export-btn">
+                            <i class="fas fa-download"></i> Download Data
+                        </a>
+                    </div>
+                    
+                    <div class="settings-item">
+                        <span class="settings-label">Database File</span>
+                        <span class="settings-value">tasks.db</span>
+                    </div>
+                    
+                    <p style="margin-top: 16px; color: var(--gray); font-size: 0.85rem;">
+                        <i class="fas fa-info-circle"></i> 
+                        Download your complete database as a CSV file for backup or analysis.
+                    </p>
                 </div>
                 
                 <div class="settings-card">
@@ -2592,7 +2752,8 @@ def index():
                                       badge.className.includes('upcoming') ? 'Upcoming' :
                                       badge.className.includes('starting_soon') ? 'Starting Soon' :
                                       badge.className.includes('due') ? 'Due' :
-                                      badge.className.includes('overdue') ? 'Overdue' : 'Completed';
+                                      badge.className.includes('overdue') ? 'Overdue' : 
+                                      badge.className.includes('completed') ? 'Completed' : 'Error';
                 });
             }
             
@@ -2616,7 +2777,9 @@ def index():
     notes=notes,
     format_text=format_text,
     python_version='3.x',
-    timedelta=timedelta)
+    timedelta=timedelta,
+    today=today,
+    debug_mode=True)
 
 # ============= ACTION ROUTES =============
 @app.route('/add_task', methods=['POST'])
@@ -2634,7 +2797,6 @@ def add_task():
     # For weekly repeat, get the day from the current date
     repeat_day = None
     if repeat == 'weekly':
-        from datetime import datetime
         now = get_ist_time()
         repeat_day = now.strftime('%A')  # Gets day name like "Monday"
     
@@ -2655,6 +2817,8 @@ def add_task():
     start_datetime = start_dt.strftime('%Y-%m-%d %H:%M:%S')
     end_datetime = end_dt.strftime('%Y-%m-%d %H:%M:%S')
     
+    print(f"🔍 DEBUG: Adding task - Title: {title}, Start: {start_datetime}, End: {end_datetime}")
+    
     # Insert task
     task_id = db_query(
         """INSERT INTO tasks (title, description, start_time, end_time, notify_enabled, 
@@ -2664,6 +2828,8 @@ def add_task():
          priority, repeat, repeat_day, repeat_end_date, 
          start_datetime if repeat != 'none' else None)
     )
+    
+    print(f"✅ Task added with ID: {task_id}")
     
     # Send notification if enabled and starting soon
     if notify_enabled:
@@ -2723,6 +2889,8 @@ def complete_task():
         task = db_query("SELECT * FROM tasks WHERE id = ?", (task_id,), fetch_one=True)
         
         if task and not task['completed']:
+            print(f"🔍 DEBUG: Completing task {task_id}")
+            
             # Mark task as completed
             db_query("UPDATE tasks SET completed = 1 WHERE id = ?", (task_id,))
             
@@ -2819,6 +2987,7 @@ def delete_task():
     
     if task_id:
         db_query("DELETE FROM tasks WHERE id = ?", (task_id,))
+        print(f"🗑️ Task {task_id} deleted")
     
     return redirect(url_for('index', view='tasks'))
 
@@ -3051,6 +3220,51 @@ def toggle_setting():
             send_telegram_message(message)
     
     return redirect(url_for('index', view='settings'))
+
+# ============= EXPORT DATABASE =============
+@app.route('/export_db')
+def export_db():
+    """Export database as CSV"""
+    if not session.get('logged_in'):
+        return redirect(url_for('index'))
+    
+    try:
+        # Create a string buffer
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Get all tables
+        tables = ['tasks', 'subtasks', 'history', 'history_subtasks', 'notes', 'settings', 'notification_log']
+        
+        # Write all data to CSV
+        for table in tables:
+            writer.writerow([f"=== {table.upper()} ==="])
+            
+            # Get table data
+            data = db_query(f"SELECT * FROM {table}", fetch_all=True)
+            
+            if data:
+                # Write headers
+                writer.writerow([column for column in data[0].keys()])
+                
+                # Write rows
+                for row in data:
+                    writer.writerow([row[column] for column in row.keys()])
+            else:
+                writer.writerow(["No data"])
+            
+            writer.writerow([])  # Empty row between tables
+        
+        # Prepare response
+        output.seek(0)
+        return Response(
+            output.getvalue(),
+            mimetype="text/csv",
+            headers={"Content-disposition": "attachment; filename=tasks_database_export.csv"}
+        )
+    except Exception as e:
+        print(f"❌ Export error: {e}")
+        return "Error exporting database", 500
 
 # ============= API ENDPOINTS =============
 @app.route('/get_task/<int:task_id>')

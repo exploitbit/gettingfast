@@ -96,6 +96,13 @@ def db_query(query, params=(), fetch_one=False):
     conn.close()
     return result
 
+# Helper to convert Row to dict
+def row_to_dict(row):
+    """Convert sqlite3.Row to dictionary"""
+    if row is None:
+        return None
+    return dict(row)
+
 # ============= TIME FUNCTIONS =============
 def get_ist_time():
     """Get current time in IST"""
@@ -145,8 +152,13 @@ def check_and_send_notifications():
         
         print(f"📋 Found {len(tasks)} active tasks")
         
-        for task in tasks:
+        for task_row in tasks:
             try:
+                # Convert Row to dict
+                task = row_to_dict(task_row)
+                if not task:
+                    continue
+                    
                 task_id = task['id']
                 task_title = task['title']
                 start_time = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
@@ -188,10 +200,12 @@ def check_and_send_notifications():
                     print(f"   🔄 Reset notifications for task {task_id}")
                     
             except Exception as e:
-                print(f"   ❌ Error with task {task.get('id')}: {e}")
+                print(f"   ❌ Error with task: {e}")
         
     except Exception as e:
         print(f"❌ Notification system error: {e}")
+        import traceback
+        traceback.print_exc()
 
 def send_daily_summary():
     """Send daily task summary"""
@@ -220,7 +234,10 @@ def send_daily_summary():
         message += f"📊 {completed}/{total} tasks completed\n"
         message += f"⏰ {now.strftime('%I:%M %p')} IST\n\n"
         
-        for task in tasks:
+        for task_row in tasks:
+            task = row_to_dict(task_row)
+            if not task:
+                continue
             status = "✅" if task['completed'] else "❌"
             start_time = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
             start_time = IST.localize(start_time)
@@ -319,7 +336,10 @@ def send_today_tasks(message):
     response = f"📅 <b>Today's Tasks ({now.strftime('%B %d')})</b>\n"
     response += f"⏰ {now.strftime('%I:%M %p')} IST\n\n"
     
-    for task in tasks:
+    for task_row in tasks:
+        task = row_to_dict(task_row)
+        if not task:
+            continue
         status = "✅" if task['completed'] else "❌"
         start_time = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
         start_time = IST.localize(start_time)
@@ -431,6 +451,21 @@ def send_time(message):
     
     bot.reply_to(message, time_msg, parse_mode='HTML')
 
+# ============= WEBHOOK ENDPOINT =============
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Telegram webhook endpoint"""
+    if request.headers.get('content-type') == 'application/json':
+        try:
+            json_string = request.get_data().decode('utf-8')
+            update = telebot.types.Update.de_json(json_string)
+            bot.process_new_updates([update])
+            return 'OK', 200
+        except Exception as e:
+            print(f"Webhook error: {e}")
+            return 'Error', 500
+    return 'Bad Request', 400
+
 # ============= FLASK WEB APP =============
 @app.route('/')
 def index():
@@ -541,7 +576,7 @@ def index():
     today = now.strftime('%Y-%m-%d')
     
     # Get tasks for today
-    tasks = db_query('''
+    tasks_rows = db_query('''
         SELECT * FROM tasks 
         WHERE date(start_time) = ?
         ORDER BY start_time
@@ -560,9 +595,12 @@ def index():
     settings = {}
     setting_rows = db_query("SELECT key, value FROM settings")
     for row in setting_rows:
-        settings[row['key']] = row['value']
+        row_dict = row_to_dict(row)
+        if row_dict:
+            settings[row_dict['key']] = row_dict['value']
     
     # Calculate stats
+    tasks = [row_to_dict(row) for row in tasks_rows if row_to_dict(row)]
     completed_today = sum(1 for t in tasks if t['completed'])
     pending_today = len(tasks) - completed_today
     
@@ -1055,15 +1093,18 @@ def index():
                 {% endif %}
                 
                 {% for item in history %}
+                {% set item_dict = row_to_dict(item) %}
+                {% if item_dict %}
                 <div style="background: white; border-radius: 12px; padding: 15px; margin-bottom: 10px; border-left: 4px solid var(--success);">
                     <div style="font-weight: 600; margin-bottom: 5px;">
-                        {{ item.task_title or item.title }}
+                        {{ item_dict.task_title or item_dict.title }}
                     </div>
                     <div style="font-size: 12px; color: #666;">
                         <i class="far fa-calendar-check"></i>
-                        {{ datetime.strptime(item.completed_at, '%Y-%m-%d %H:%M:%S').strftime('%B %d, %I:%M %p') }} IST
+                        {{ datetime.strptime(item_dict.completed_at, '%Y-%m-%d %H:%M:%S').strftime('%B %d, %I:%M %p') }} IST
                     </div>
                 </div>
+                {% endif %}
                 {% endfor %}
             </div>
             
@@ -1204,7 +1245,8 @@ def index():
     now=now,
     USER_ID=USER_ID,
     completed_today=completed_today,
-    pending_today=pending_today)
+    pending_today=pending_today,
+    row_to_dict=row_to_dict)
 
 # ============= ACTION ROUTES =============
 @app.route('/login', methods=['POST'])
@@ -1213,7 +1255,8 @@ def login():
     code = request.form.get('code', '')
     
     setting = db_query("SELECT value FROM settings WHERE key = 'access_code'", fetch_one=True)
-    correct_code = setting['value'] if setting else ADMIN_CODE
+    setting_dict = row_to_dict(setting)
+    correct_code = setting_dict['value'] if setting_dict else ADMIN_CODE
     
     if code == correct_code:
         resp = Response('', status=302)
@@ -1283,7 +1326,8 @@ def complete_task():
     task_id = request.form.get('task_id')
     
     if task_id:
-        task = db_query("SELECT * FROM tasks WHERE id = ?", (task_id,), fetch_one=True)
+        task_row = db_query("SELECT * FROM tasks WHERE id = ?", (task_id,), fetch_one=True)
+        task = row_to_dict(task_row)
         
         if task and not task['completed']:
             db_query("UPDATE tasks SET completed = 1 WHERE id = ?", (task_id,))
@@ -1346,7 +1390,12 @@ def change_code():
 def start_bot_polling():
     """Start Telegram bot polling in background"""
     print("🤖 Starting Telegram bot polling...")
-    bot.polling(none_stop=True, interval=1, timeout=30)
+    try:
+        bot.polling(none_stop=True, interval=1, timeout=30)
+    except Exception as e:
+        print(f"❌ Bot polling error: {e}")
+        time.sleep(5)
+        start_bot_polling()
 
 if __name__ == '__main__':
     print("=" * 60)

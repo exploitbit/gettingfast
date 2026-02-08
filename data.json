@@ -26,9 +26,18 @@
       "time": "11:08 PM",
       "type": "task",
       "source": "telegram"
+    },
+    {
+      "id": 4,
+      "text": "/tasks",
+      "timestamp": "2026-02-08 23:09:05",
+      "date": "February 08, 2026",
+      "time": "11:09 PM",
+      "type": "task",
+      "source": "telegram"
     }
   ],
   "messages": [],
   "notes": [],
-  "last_id": 3
+  "last_id": 4
 }

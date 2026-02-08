@@ -62,9 +62,18 @@
       "time": "11:15 PM",
       "type": "task",
       "source": "telegram"
+    },
+    {
+      "id": 8,
+      "text": "return html.format(\n            now.strftime('%B %d, %Y'),\n            len(data[\"tasks\"]),\n            github_status,\n            last_update,\n            tasks_html\n        )\n        \n    except Exception as e:\n        error_html = f'''\n        <!DOCTYPE html>\n        <html>\n        <head><title>Error</title><style>body {{ padding: 40px; font-family: sans-serif; }}</style></head>\n        <body>\n            <h1>⚠️ Server Error</h1>\n            <div style=\"background: #fee; padding: 20px; border-radius: 8px; margin: 20px 0;\">\n                <strong>Error:</strong> {str(e)}\n            </div>\n            <p>Please check server logs for details.</p>\n            <button onclick=\"location.reload()\">Retry</button>\n        </body>\n        </html>\n        '''\n        return error_html\n\n@app.route('/download')\nde",
+      "timestamp": "2026-02-08 23:15:26",
+      "date": "February 08, 2026",
+      "time": "11:15 PM",
+      "type": "task",
+      "source": "telegram"
     }
   ],
   "messages": [],
   "notes": [],
-  "last_id": 7
+  "last_id": 8
 }

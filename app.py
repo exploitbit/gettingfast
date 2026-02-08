@@ -1,6 +1,6 @@
+
 """
-Simple Task Tracker - GitHub Storage
-Works on Koyeb without gunicorn issues
+Simple Task Tracker with GitHub Storage
 """
 
 import os
@@ -13,15 +13,14 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import requests
 import base64
-import io
 
 # ============= CONFIGURATION =============
 BOT_TOKEN = "8388773187:AAFxz5U8GJ94Wf21VaGvFx9QQSZFU2Rd43I"
 USER_ID = "8469993808"
 
-# GitHub Configuration - SET THESE IN KOYEB ENVIRONMENT VARIABLES
-GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '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')
-GITHUB_REPO = os.getenv('GITHUB_REPO', 'Qepheyr/gettingfast')
+# GitHub Configuration - UPDATED WITH YOUR INFO
+GITHUB_TOKEN = "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"
+GITHUB_REPO = "Qepheyr/gettingfast"
 GITHUB_FILE_PATH = "data.json"
 
 # Timezone setup
@@ -31,14 +30,10 @@ IST = pytz.timezone('Asia/Kolkata')
 app = Flask(__name__)
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# ============= SIMPLE GITHUB FUNCTIONS =============
-def get_github_data():
-    """Get data from GitHub"""
+# ============= GITHUB HELPER FUNCTIONS =============
+def load_from_github():
+    """Load data from GitHub"""
     try:
-        if not GITHUB_TOKEN or GITHUB_TOKEN == 'ghp_yourtokenhere':
-            print("GitHub token not set")
-            return None
-            
         url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
         headers = {
             "Authorization": f"token {GITHUB_TOKEN}",
@@ -52,38 +47,35 @@ def get_github_data():
             decoded = base64.b64decode(content).decode('utf-8')
             return json.loads(decoded)
         elif response.status_code == 404:
-            # File doesn't exist yet
+            # File doesn't exist yet, return default
             return {
                 "tasks": [],
-                "last_id": 0,
-                "created_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                "messages": [],
+                "notes": [],
+                "last_id": 0
             }
         else:
-            print(f"GitHub error: {response.status_code}")
+            print(f"GitHub API Error: {response.status_code}")
             return None
-            
     except Exception as e:
-        print(f"Error getting GitHub data: {e}")
+        print(f"Error loading from GitHub: {e}")
         return None
 
 def save_to_github(data):
     """Save data to GitHub"""
     try:
-        if not GITHUB_TOKEN or GITHUB_TOKEN == 'ghp_yourtokenhere':
-            print("GitHub token not set")
-            return False
-            
+        # First, get the current file to get SHA (for update)
         url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
         headers = {
             "Authorization": f"token {GITHUB_TOKEN}",
             "Accept": "application/vnd.github.v3+json"
         }
         
-        # First, check if file exists to get SHA
+        get_response = requests.get(url, headers=headers)
         sha = None
-        check_response = requests.get(url, headers=headers)
-        if check_response.status_code == 200:
-            sha = check_response.json()["sha"]
+        
+        if get_response.status_code == 200:
+            sha = get_response.json()["sha"]
         
         # Prepare content
         content = json.dumps(data, indent=2, ensure_ascii=False)
@@ -91,7 +83,7 @@ def save_to_github(data):
         
         # Create payload
         payload = {
-            "message": f"Update tasks - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            "message": f"Update tasks data - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             "content": encoded,
             "branch": "main"
         }
@@ -99,86 +91,147 @@ def save_to_github(data):
         if sha:
             payload["sha"] = sha
         
-        # Save to GitHub
+        # Make request
         response = requests.put(url, headers=headers, json=payload)
         
         if response.status_code in [200, 201]:
-            print("Saved to GitHub successfully")
+            print("✅ Successfully saved to GitHub")
             return True
         else:
-            print(f"Failed to save to GitHub: {response.status_code}")
+            print(f"❌ GitHub save error: {response.status_code} - {response.text}")
             return False
             
     except Exception as e:
-        print(f"Error saving to GitHub: {e}")
+        print(f"❌ Error saving to GitHub: {e}")
         return False
 
 def get_ist_time():
     """Get current time in IST"""
     return datetime.now(IST)
 
-# ============= TELEGRAM BOT =============
+# ============= FALLBACK LOCAL STORAGE =============
+LOCAL_DATA_FILE = 'data_backup.json'
+
+def load_data():
+    """Load data - try GitHub first, then local backup"""
+    data = load_from_github()
+    
+    if data is not None:
+        # Save local backup
+        try:
+            with open(LOCAL_DATA_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"⚠️ Could not save local backup: {e}")
+        return data
+    else:
+        # Fallback to local file
+        try:
+            if os.path.exists(LOCAL_DATA_FILE):
+                with open(LOCAL_DATA_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception as e:
+            print(f"⚠️ Error loading local backup: {e}")
+        
+        return {
+            "tasks": [],
+            "messages": [],
+            "notes": [],
+            "last_id": 0
+        }
+
+def save_data(data):
+    """Save data - try GitHub first, then local backup"""
+    success = save_to_github(data)
+    
+    # Always save local backup
+    try:
+        with open(LOCAL_DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ Could not save local backup: {e}")
+    
+    return success
+
+# ============= TELEGRAM BOT COMMANDS =============
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    """Welcome message"""
+    """Send welcome message"""
     if str(message.chat.id) != USER_ID:
-        bot.reply_to(message, "❌ Unauthorized")
+        bot.reply_to(message, "❌ <b>Unauthorized Access</b>")
         return
     
-    welcome_text = f"""
-🤖 <b>Task Tracker Bot</b>
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("📝 Add Task", callback_data='add_task'),
+        InlineKeyboardButton("📋 View Tasks", callback_data='view_tasks'),
+        InlineKeyboardButton("📥 Download Data", callback_data='download_data'),
+        InlineKeyboardButton("🌐 Open Web", url="https://handsome-rafaela-sandip232-7f9d347c.koyeb.app/"),
+        InlineKeyboardButton("🔄 Refresh", callback_data='refresh'),
+        InlineKeyboardButton("🗑️ Clear All", callback_data='clear_data')
+    )
+    
+    welcome = """
+🤖 <b>GitHub Task Tracker</b>
+<i>Data saved to GitHub repository</i>
 
-<i>Commands:</i>
-• Just send a message - it will be saved
-• /tasks - View your tasks
-• /download - Get JSON file
-• /clear - Delete all data
+<u>Commands:</u>
+• <code>/add</code> - Add a new task
+• <code>/tasks</code> - View your tasks
+• <code>/download</code> - Download JSON data
+• <code>/clear</code> - Clear all data
 
-<b>Web Interface:</b>
-https://handsome-rafaela-sandip232-7f9d347c.koyeb.app/
+<u>How to use:</u>
+1. Send any message - it will be saved
+2. View data on web interface
+3. Download JSON anytime
 
-<b>Current Time:</b>
-{get_ist_time().strftime('%I:%M %p')} IST
-
-<b>Storage:</b>
+<u>Storage:</u>
 ✅ GitHub Repository
+📁 Local backup
 """
-    bot.send_message(message.chat.id, welcome_text, parse_mode='HTML')
+    bot.send_message(message.chat.id, welcome, parse_mode='HTML', reply_markup=keyboard)
+
+@bot.message_handler(commands=['add'])
+def add_task_command(message):
+    """Add task command"""
+    if str(message.chat.id) != USER_ID:
+        return
+    
+    bot.reply_to(message, "📝 <b>Send me your task:</b>\n\nJust type and send your message. I'll save it to GitHub.", parse_mode='HTML')
 
 @bot.message_handler(func=lambda message: True)
-def handle_message(message):
+def save_message(message):
     """Save any message as task"""
     if str(message.chat.id) != USER_ID:
         return
     
-    # Get current data
-    data = get_github_data()
-    if data is None:
-        data = {"tasks": [], "last_id": 0}
+    # Load existing data
+    data = load_data()
     
     # Create new task
     new_task = {
-        "id": data.get("last_id", 0) + 1,
+        "id": data["last_id"] + 1,
         "text": message.text,
-        "date": get_ist_time().strftime('%Y-%m-%d'),
+        "timestamp": get_ist_time().strftime('%Y-%m-%d %H:%M:%S'),
+        "date": get_ist_time().strftime('%B %d, %Y'),
         "time": get_ist_time().strftime('%I:%M %p'),
-        "timestamp": get_ist_time().strftime('%Y-%m-%d %H:%M:%S')
+        "type": "task",
+        "source": "telegram"
     }
     
-    if "tasks" not in data:
-        data["tasks"] = []
-    
+    # Add to tasks
     data["tasks"].append(new_task)
-    data["last_id"] = data.get("last_id", 0) + 1
-    data["updated_at"] = get_ist_time().strftime('%Y-%m-%d %H:%M:%S')
+    data["last_id"] += 1
     
-    # Save to GitHub
-    success = save_to_github(data)
+    # Save data
+    success = save_data(data)
     
+    # Send confirmation
     if success:
-        reply = f"✅ <b>Saved to GitHub!</b>\n\n{message.text}\n\n📅 {new_task['date']}\n⏰ {new_task['time']} IST"
+        reply = f"✅ <b>Task Saved to GitHub!</b>\n\n{message.text}\n\n📅 {new_task['date']}\n⏰ {new_task['time']} IST\n\n<i>Synced to repository</i>"
     else:
-        reply = f"❌ <b>Save failed!</b>\n\nCould not save to GitHub. Check token and repository."
+        reply = f"⚠️ <b>Saved Locally (GitHub Error)</b>\n\n{message.text}\n\n📅 {new_task['date']}\n⏰ {new_task['time']} IST\n\n<i>Saved to local backup only</i>"
     
     bot.reply_to(message, reply, parse_mode='HTML')
 
@@ -188,144 +241,230 @@ def show_tasks(message):
     if str(message.chat.id) != USER_ID:
         return
     
-    data = get_github_data()
+    data = load_data()
     
-    if not data or "tasks" not in data or not data["tasks"]:
-        bot.reply_to(message, "📭 <b>No tasks found!</b>\n\nSend a message to add your first task.", parse_mode='HTML')
+    if not data["tasks"]:
+        bot.reply_to(message, "📭 <b>No tasks yet!</b>\n\nSend me a message to add your first task.", parse_mode='HTML')
         return
     
-    response = f"📋 <b>Your Tasks ({len(data['tasks'])} total):</b>\n\n"
+    response = "📋 <b>Your Tasks:</b>\n\n"
     
-    for task in data["tasks"][-10:]:
-        response += f"• {task['text']}\n"
-        response += f"  ⏰ {task['time']} | 📅 {task['date']}\n\n"
+    # Show last 10 tasks (newest first)
+    tasks_to_show = data["tasks"][-10:] if len(data["tasks"]) > 10 else data["tasks"]
+    tasks_to_show = list(reversed(tasks_to_show))  # Reverse to show newest first
+    
+    for task in tasks_to_show:
+        response += f"🔹 {task['text']}\n"
+        response += f"   📅 {task['date']} | ⏰ {task['time']}\n\n"
+    
+    if len(data["tasks"]) > 10:
+        response += f"\n<i>Showing last 10 of {len(data['tasks'])} total tasks</i>"
     
     bot.reply_to(message, response, parse_mode='HTML')
 
+def download_from_github():
+    """Download data.json directly from GitHub"""
+    try:
+        url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_FILE_PATH}"
+        response = requests.get(url)
+        
+        if response.status_code == 200:
+            return response.content
+        else:
+            # Try via API
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
+            headers = {
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json"
+            }
+            
+            response = requests.get(url, headers=headers)
+            if response.status_code == 200:
+                content = response.json()["content"]
+                return base64.b64decode(content)
+            else:
+                return None
+    except Exception as e:
+        print(f"Error downloading from GitHub: {e}")
+        return None
+
 @bot.message_handler(commands=['download'])
-def download_data(message):
-    """Download JSON file"""
+def download_data_command(message):
+    """Send JSON file directly from GitHub"""
     if str(message.chat.id) != USER_ID:
         return
     
-    data = get_github_data()
+    # Try to get data directly from GitHub
+    github_data = download_from_github()
     
-    if not data:
-        bot.reply_to(message, "❌ <b>No data found!</b>", parse_mode='HTML')
-        return
-    
-    # Create JSON file
-    json_str = json.dumps(data, indent=2, ensure_ascii=False)
-    
-    # Send as file
-    bot.send_document(
-        chat_id=message.chat.id,
-        document=io.BytesIO(json_str.encode('utf-8')),
-        visible_file_name='tasks_data.json',
-        caption="📁 <b>Tasks Data Export</b>\n\nJSON file from GitHub repository"
-    )
+    if github_data:
+        # Send GitHub data
+        import io
+        bot.send_document(
+            message.chat.id,
+            io.BytesIO(github_data),
+            visible_file_name='data.json',
+            caption="📁 <b>GitHub Data Export</b>\n\nDirect download from GitHub repository.",
+            parse_mode='HTML'
+        )
+    else:
+        # Fallback to local data
+        data = load_data()
+        import io
+        json_data = json.dumps(data, indent=2, ensure_ascii=False)
+        
+        bot.send_document(
+            message.chat.id,
+            io.BytesIO(json_data.encode('utf-8')),
+            visible_file_name='data_backup.json',
+            caption="📁 <b>Local Backup Export</b>\n\nUsing local backup (GitHub unreachable).",
+            parse_mode='HTML'
+        )
 
 @bot.message_handler(commands=['clear'])
-def clear_data(message):
+def clear_data_command(message):
     """Clear all data"""
     if str(message.chat.id) != USER_ID:
         return
     
-    # Create empty data
-    empty_data = {
-        "tasks": [],
-        "last_id": 0,
-        "cleared_at": get_ist_time().strftime('%Y-%m-%d %H:%M:%S')
-    }
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(
+        InlineKeyboardButton("✅ Yes, clear all", callback_data='confirm_clear'),
+        InlineKeyboardButton("❌ Cancel", callback_data='cancel_clear')
+    )
     
-    # Save to GitHub
-    success = save_to_github(empty_data)
+    bot.reply_to(message, "⚠️ <b>Warning!</b>\n\nThis will delete ALL data from GitHub repository.\nAre you sure?", parse_mode='HTML', reply_markup=keyboard)
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback(call):
+    """Handle callback queries"""
+    chat_id = call.message.chat.id
     
-    if success:
-        bot.reply_to(message, "🗑️ <b>All data cleared from GitHub!</b>", parse_mode='HTML')
-    else:
-        bot.reply_to(message, "❌ <b>Failed to clear data!</b>", parse_mode='HTML')
+    if str(chat_id) != USER_ID:
+        return
+    
+    if call.data == 'add_task':
+        bot.send_message(chat_id, "📝 <b>Send me your task:</b>\n\nJust type and send your message.", parse_mode='HTML')
+    
+    elif call.data == 'view_tasks':
+        show_tasks(call.message)
+    
+    elif call.data == 'download_data':
+        download_data_command(call.message)
+    
+    elif call.data == 'refresh':
+        data = load_data()
+        if data["tasks"]:
+            last_task = data["tasks"][-1]
+            last_text = last_task['text'][:50] + '...' if len(last_task['text']) > 50 else last_task['text']
+        else:
+            last_text = 'None'
+            
+        bot.edit_message_text(
+            f"🔄 <b>Refreshed!</b>\n\nTotal tasks: {len(data['tasks'])}\nLast task: {last_text}",
+            chat_id,
+            call.message.message_id,
+            parse_mode='HTML'
+        )
+    
+    elif call.data == 'clear_data':
+        clear_data_command(call.message)
+    
+    elif call.data == 'confirm_clear':
+        # Clear data
+        empty_data = {
+            "tasks": [],
+            "messages": [],
+            "notes": [],
+            "last_id": 0
+        }
+        success = save_data(empty_data)
+        
+        if success:
+            bot.edit_message_text("🗑️ <b>All data cleared from GitHub!</b>", chat_id, call.message.message_id, parse_mode='HTML')
+        else:
+            bot.edit_message_text("⚠️ <b>Failed to clear from GitHub</b>\n\nLocal data cleared only.", chat_id, call.message.message_id, parse_mode='HTML')
+    
+    elif call.data == 'cancel_clear':
+        bot.edit_message_text("✅ <b>Cancelled</b>\n\nYour data is safe.", chat_id, call.message.message_id, parse_mode='HTML')
+    
+    bot.answer_callback_query(call.id)
 
 # ============= FLASK WEB APP =============
 @app.route('/')
-def home():
-    """Main web page showing data.json content"""
+def index():
+    """Web interface to view data"""
     try:
-        # Get data from GitHub
-        data = get_github_data()
+        data = load_data()
+        now = get_ist_time()
         
-        if data is None:
-            # Show error if can't get data
-            return '''
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Task Tracker</title>
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <style>
-                    body { font-family: Arial, sans-serif; margin: 40px; }
-                    .error { background: #ffebee; color: #c62828; padding: 20px; border-radius: 8px; }
-                </style>
-            </head>
-            <body>
-                <h1>⚠️ Error</h1>
-                <div class="error">
-                    <h3>Cannot load data from GitHub</h3>
-                    <p>Possible issues:</p>
-                    <ul>
-                        <li>GitHub token not set correctly</li>
-                        <li>Repository not found: Qepheyr/gettingfast</li>
-                        <li>No data.json file in repository</li>
-                    </ul>
-                </div>
-            </body>
-            </html>
-            '''
-        
-        # Create HTML page
         html = '''
         <!DOCTYPE html>
         <html>
         <head>
-            <title>Task Tracker - GitHub Data</title>
+            <title>GitHub Task Tracker</title>
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <style>
-                body {
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                * {
                     margin: 0;
-                    padding: 20px;
+                    padding: 0;
+                    box-sizing: border-box;
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                }
+                
+                body {
                     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                     min-height: 100vh;
+                    padding: 20px;
                 }
+                
                 .container {
-                    max-width: 1000px;
+                    max-width: 800px;
                     margin: 0 auto;
                     background: white;
                     border-radius: 15px;
                     box-shadow: 0 10px 30px rgba(0,0,0,0.2);
                     overflow: hidden;
                 }
+                
                 .header {
                     background: linear-gradient(135deg, #24292e 0%, #0366d6 100%);
                     color: white;
-                    padding: 30px;
+                    padding: 25px;
                     text-align: center;
                 }
+                
                 .header h1 {
-                    margin: 0;
-                    font-size: 28px;
+                    font-size: 2.2rem;
+                    margin-bottom: 10px;
                     display: flex;
                     align-items: center;
                     justify-content: center;
                     gap: 10px;
                 }
+                
+                .header p {
+                    opacity: 0.9;
+                    font-size: 1rem;
+                }
+                
+                .github-badge {
+                    display: inline-block;
+                    background: rgba(255,255,255,0.1);
+                    padding: 5px 10px;
+                    border-radius: 20px;
+                    font-size: 0.8rem;
+                    margin-top: 5px;
+                }
+                
                 .stats {
                     display: grid;
-                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                    gap: 20px;
-                    padding: 25px;
+                    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+                    gap: 15px;
+                    padding: 20px;
                     background: #f8f9fa;
                 }
+                
                 .stat-card {
                     background: white;
                     padding: 20px;
@@ -333,143 +472,187 @@ def home():
                     text-align: center;
                     box-shadow: 0 3px 10px rgba(0,0,0,0.1);
                 }
+                
                 .stat-number {
-                    font-size: 32px;
+                    font-size: 2rem;
                     font-weight: bold;
                     color: #0366d6;
                     margin-bottom: 5px;
                 }
+                
                 .stat-label {
                     color: #666;
-                    font-size: 14px;
+                    font-size: 0.9rem;
                 }
+                
                 .content {
                     padding: 30px;
                 }
-                .tabs {
-                    display: flex;
-                    gap: 10px;
-                    margin-bottom: 20px;
-                    border-bottom: 2px solid #e1e4e8;
+                
+                .section {
+                    margin-bottom: 30px;
+                }
+                
+                .section-title {
+                    font-size: 1.3rem;
+                    color: #333;
+                    margin-bottom: 15px;
                     padding-bottom: 10px;
+                    border-bottom: 2px solid #0366d6;
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
                 }
-                .tab-btn {
-                    padding: 10px 20px;
-                    background: #f6f8fa;
-                    border: none;
-                    border-radius: 6px;
-                    cursor: pointer;
-                    font-weight: 500;
+                
+                .section-title i {
+                    color: #0366d6;
                 }
-                .tab-btn.active {
-                    background: #0366d6;
-                    color: white;
-                }
-                .tab-content {
-                    display: none;
-                }
-                .tab-content.active {
-                    display: block;
-                }
+                
                 .task-list {
                     display: flex;
                     flex-direction: column;
                     gap: 15px;
                 }
+                
                 .task-card {
-                    background: #f6f8fa;
+                    background: #f8f9fa;
                     border-radius: 10px;
                     padding: 20px;
-                    border-left: 4px solid #28a745;
-                    transition: transform 0.2s;
+                    border-left: 4px solid #0366d6;
+                    transition: transform 0.3s, box-shadow 0.3s;
                 }
+                
                 .task-card:hover {
-                    transform: translateY(-2px);
+                    transform: translateY(-3px);
                     box-shadow: 0 5px 15px rgba(0,0,0,0.1);
                 }
+                
                 .task-text {
-                    font-size: 16px;
+                    font-size: 1.1rem;
+                    color: #333;
                     margin-bottom: 10px;
-                    line-height: 1.5;
+                    line-height: 1.4;
                 }
+                
                 .task-meta {
                     display: flex;
                     justify-content: space-between;
-                    font-size: 14px;
-                    color: #586069;
+                    font-size: 0.85rem;
+                    color: #666;
                 }
-                .json-viewer {
-                    background: #f6f8fa;
-                    border-radius: 10px;
-                    padding: 20px;
-                    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
-                    font-size: 14px;
-                    white-space: pre-wrap;
-                    word-wrap: break-word;
-                    max-height: 500px;
-                    overflow-y: auto;
+                
+                .empty-state {
+                    text-align: center;
+                    padding: 40px 20px;
+                    color: #666;
                 }
-                .actions {
-                    display: flex;
-                    gap: 15px;
-                    margin: 25px 0;
-                    flex-wrap: wrap;
+                
+                .empty-state i {
+                    font-size: 3rem;
+                    margin-bottom: 15px;
+                    opacity: 0.3;
                 }
+                
+                .empty-state p {
+                    font-size: 1.1rem;
+                    margin-bottom: 20px;
+                }
+                
                 .btn {
-                    display: inline-flex;
-                    align-items: center;
-                    gap: 8px;
-                    padding: 12px 24px;
+                    display: inline-block;
                     background: #0366d6;
                     color: white;
-                    text-decoration: none;
+                    padding: 12px 25px;
                     border-radius: 8px;
-                    font-weight: 500;
-                    transition: background 0.2s;
+                    text-decoration: none;
+                    font-weight: 600;
+                    transition: background 0.3s;
+                    border: none;
+                    cursor: pointer;
+                    font-size: 1rem;
                 }
+                
                 .btn:hover {
                     background: #005cc5;
                 }
-                .btn-telegram {
-                    background: #0088cc;
-                }
-                .btn-telegram:hover {
-                    background: #0077b5;
-                }
+                
                 .btn-download {
                     background: #28a745;
                 }
+                
                 .btn-download:hover {
                     background: #218838;
                 }
-                .empty-state {
-                    text-align: center;
-                    padding: 40px;
-                    color: #586069;
+                
+                .btn-clear {
+                    background: #dc3545;
                 }
-                .empty-state-icon {
-                    font-size: 48px;
-                    margin-bottom: 15px;
-                    opacity: 0.5;
+                
+                .btn-clear:hover {
+                    background: #c82333;
                 }
-                .timestamp {
-                    color: #586069;
-                    font-size: 14px;
-                    margin-top: 10px;
+                
+                .btn-telegram {
+                    background: #0088cc;
                 }
+                
+                .btn-telegram:hover {
+                    background: #0077b5;
+                }
+                
+                .actions {
+                    display: flex;
+                    gap: 15px;
+                    margin-top: 20px;
+                    flex-wrap: wrap;
+                }
+                
+                .info-box {
+                    background: #e9ecef;
+                    padding: 15px;
+                    border-radius: 10px;
+                    margin-top: 20px;
+                    border-left: 4px solid #28a745;
+                }
+                
+                .info-box.warning {
+                    border-left-color: #ffc107;
+                    background: #fff3cd;
+                }
+                
+                .info-box.error {
+                    border-left-color: #dc3545;
+                    background: #f8d7da;
+                }
+                
                 @media (max-width: 768px) {
                     .container {
                         border-radius: 10px;
                     }
+                    
+                    .header {
+                        padding: 20px;
+                    }
+                    
+                    .header h1 {
+                        font-size: 1.8rem;
+                    }
+                    
+                    .content {
+                        padding: 20px;
+                    }
+                    
                     .stats {
                         grid-template-columns: 1fr;
                     }
+                    
                     .actions {
                         flex-direction: column;
                     }
+                    
                     .btn {
                         width: 100%;
-                        justify-content: center;
+                        text-align: center;
                     }
                 }
             </style>
@@ -478,8 +661,11 @@ def home():
         <body>
             <div class="container">
                 <div class="header">
-                    <h1><i class="fab fa-github"></i> Task Tracker - GitHub Data</h1>
-                    <p>Data stored in: Qepheyr/gettingfast • Updated: {}</p>
+                    <h1><i class="fab fa-github"></i> GitHub Task Tracker</h1>
+                    <p>Data stored in GitHub repository • {}</p>
+                    <div class="github-badge">
+                        <i class="fas fa-database"></i> Synced to GitHub
+                    </div>
                 </div>
                 
                 <div class="stats">
@@ -489,213 +675,280 @@ def home():
                     </div>
                     <div class="stat-card">
                         <div class="stat-number">{}</div>
-                        <div class="stat-label">Last Task ID</div>
+                        <div class="stat-label">Last Update</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-number">{}</div>
-                        <div class="stat-label">Last Updated</div>
+                        <div class="stat-label">Storage</div>
                     </div>
                 </div>
                 
                 <div class="content">
-                    <div class="tabs">
-                        <button class="tab-btn active" onclick="switchTab('tasks')">
-                            <i class="fas fa-tasks"></i> Tasks View
-                        </button>
-                        <button class="tab-btn" onclick="switchTab('json')">
-                            <i class="fas fa-code"></i> JSON View
-                        </button>
-                        <button class="tab-btn" onclick="switchTab('raw')">
-                            <i class="fas fa-file-code"></i> Raw JSON
-                        </button>
-                    </div>
-                    
-                    <div id="tasks-tab" class="tab-content active">
+                    <div class="section">
+                        <h2 class="section-title"><i class="fas fa-tasks"></i> Your Tasks (Newest First)</h2>
+                        
                         {}
-                    </div>
-                    
-                    <div id="json-tab" class="tab-content">
-                        <div class="json-viewer">
-                            {}
-                        </div>
-                    </div>
-                    
-                    <div id="raw-tab" class="tab-content">
-                        <div class="json-viewer">
-{}
-                        </div>
                     </div>
                     
                     <div class="actions">
                         <a href="/download" class="btn btn-download">
-                            <i class="fas fa-download"></i> Download JSON
+                            <i class="fas fa-download"></i> Download GitHub JSON
                         </a>
+                        <button onclick="clearData()" class="btn btn-clear">
+                            <i class="fas fa-trash"></i> Clear All Data
+                        </button>
                         <a href="https://t.me/tasktracker_simple_bot" target="_blank" class="btn btn-telegram">
-                            <i class="fab fa-telegram"></i> Telegram Bot
+                            <i class="fab fa-telegram"></i> Open Telegram
                         </a>
-                        <button onclick="refreshPage()" class="btn">
+                        <button onclick="refreshData()" class="btn">
                             <i class="fas fa-sync"></i> Refresh
                         </button>
                     </div>
+                    
+                    <div class="info-box">
+                        <p><i class="fas fa-info-circle"></i> <strong>How to use:</strong></p>
+                        <p>1. Send any message to Telegram bot - it auto-saves to GitHub</p>
+                        <p>2. View data here or download JSON</p>
+                        <p>3. Data is synced to GitHub repository</p>
+                    </div>
+                    
+                    {}
                 </div>
             </div>
             
             <script>
-                function switchTab(tabName) {
-                    // Hide all tabs
-                    document.querySelectorAll('.tab-content').forEach(tab => {
-                        tab.classList.remove('active');
-                    });
-                    document.querySelectorAll('.tab-btn').forEach(btn => {
-                        btn.classList.remove('active');
-                    });
-                    
-                    // Show selected tab
-                    document.getElementById(tabName + '-tab').classList.add('active');
-                    event.target.classList.add('active');
+                function clearData() {
+                    if (confirm('⚠️ Delete ALL data from GitHub? This cannot be undone!')) {
+                        fetch('/clear', { method: 'POST' })
+                            .then(response => response.json())
+                            .then(data => {
+                                if (data.success) {
+                                    alert('✅ All data cleared from GitHub!');
+                                    location.reload();
+                                } else {
+                                    alert('❌ Error: ' + data.error);
+                                }
+                            })
+                            .catch(error => {
+                                alert('❌ Error: ' + error);
+                            });
+                    }
                 }
                 
-                function refreshPage() {
+                function refreshData() {
                     location.reload();
                 }
                 
                 // Auto-refresh every 30 seconds
-                setTimeout(refreshPage, 30000);
+                setTimeout(() => {
+                    location.reload();
+                }, 30000);
             </script>
         </body>
         </html>
         '''
         
-        # Prepare task cards HTML
-        tasks = data.get('tasks', [])
-        if not tasks:
+        # Prepare tasks HTML
+        if not data["tasks"]:
             tasks_html = '''
             <div class="empty-state">
-                <div class="empty-state-icon">📭</div>
-                <h3>No tasks yet</h3>
-                <p>Send a message to the Telegram bot to add your first task!</p>
+                <i class="fas fa-inbox"></i>
+                <p>No tasks yet! Send a message to the Telegram bot to get started.</p>
+                <a href="https://t.me/tasktracker_simple_bot" target="_blank" class="btn btn-telegram">
+                    <i class="fab fa-telegram"></i> Open Telegram Bot
+                </a>
             </div>
             '''
         else:
             tasks_html = '<div class="task-list">'
-            for task in reversed(tasks):  # Show newest first
+            # Show newest first
+            for task in reversed(data["tasks"]):
+                # Escape HTML in task text
+                task_text = task["text"].replace('<', '&lt;').replace('>', '&gt;')
                 tasks_html += f'''
                 <div class="task-card">
-                    <div class="task-text">{task.get('text', '')}</div>
+                    <div class="task-text">{task_text}</div>
                     <div class="task-meta">
-                        <span><i class="far fa-calendar"></i> {task.get('date', '')}</span>
-                        <span><i class="far fa-clock"></i> {task.get('time', '')} IST</span>
-                        <span>ID: {task.get('id', '')}</span>
+                        <span><i class="far fa-calendar"></i> {task["date"]}</span>
+                        <span><i class="far fa-clock"></i> {task["time"]} IST</span>
+                        <span><i class="fab fa-github"></i> GitHub</span>
                     </div>
                 </div>
                 '''
             tasks_html += '</div>'
         
-        # Get formatted JSON
-        formatted_json = json.dumps(data, indent=2)
-        escaped_json = json.dumps(data).replace('<', '&lt;').replace('>', '&gt;')
+        # Calculate data size
+        data_size = len(json.dumps(data).encode('utf-8'))
+        size_str = f"{data_size/1024:.1f} KB" if data_size > 1024 else f"{data_size} bytes"
         
-        # Get timestamps
-        updated_at = data.get('updated_at', 'Never')
-        created_at = data.get('created_at', 'Unknown')
+        # Get last update time
+        last_update = "Never"
+        if data["tasks"]:
+            last_task = data["tasks"][-1]
+            last_update = f"{last_task['time']}"
+        
+        # Check GitHub connection
+        github_status = ''
+        try:
+            test = load_from_github()
+            if test is not None:
+                github_status = '<div class="info-box"><i class="fas fa-check-circle"></i> <strong>GitHub Status:</strong> Connected and syncing</div>'
+            else:
+                github_status = '<div class="info-box warning"><i class="fas fa-exclamation-triangle"></i> <strong>GitHub Status:</strong> Using local backup only</div>'
+        except:
+            github_status = '<div class="info-box error"><i class="fas fa-times-circle"></i> <strong>GitHub Status:</strong> Connection error</div>'
         
         return html.format(
-            updated_at,
-            len(tasks),
-            data.get('last_id', 0),
-            updated_at,
+            now.strftime('%B %d, %Y %I:%M %p'),
+            len(data["tasks"]),
+            last_update,
+            "GitHub + Local",
             tasks_html,
-            formatted_json,
-            escaped_json
+            github_status
         )
-        
     except Exception as e:
-        error_html = f'''
+        # Return a simple error page
+        error_html = f"""
         <!DOCTYPE html>
         <html>
-        <head><title>Error</title><style>body {{ padding: 40px; font-family: sans-serif; }}</style></head>
-        <body>
-            <h1>⚠️ Error</h1>
-            <div style="background: #ffebee; padding: 20px; border-radius: 8px;">
-                <p><strong>Error details:</strong> {str(e)}</p>
-            </div>
+        <head><title>Error</title></head>
+        <body style="font-family: Arial; padding: 50px; text-align: center;">
+            <h1>⚠️ Application Error</h1>
+            <p>{str(e)}</p>
+            <p>Please check the logs for more details.</p>
+            <button onclick="location.reload()">Retry</button>
         </body>
         </html>
-        '''
+        """
         return error_html
 
 @app.route('/download')
 def download_json():
-    """Download data.json file"""
-    data = get_github_data()
-    
-    if data is None:
-        return "No data available", 404
-    
-    json_str = json.dumps(data, indent=2, ensure_ascii=False)
-    
-    return send_file(
-        io.BytesIO(json_str.encode('utf-8')),
-        mimetype='application/json',
-        as_attachment=True,
-        download_name='data.json'
-    )
+    """Download JSON file directly from GitHub"""
+    try:
+        # Try to get data directly from GitHub raw URL first
+        url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{GITHUB_FILE_PATH}"
+        response = requests.get(url)
+        
+        if response.status_code == 200:
+            from flask import Response
+            return Response(
+                response.content,
+                mimetype="application/json",
+                headers={"Content-Disposition": "attachment;filename=data.json"}
+            )
+        
+        # Fallback to API method
+        github_data = download_from_github()
+        if github_data:
+            from flask import Response
+            return Response(
+                github_data,
+                mimetype="application/json",
+                headers={"Content-Disposition": "attachment;filename=data.json"}
+            )
+        
+        # Last resort: use local data
+        data = load_data()
+        json_data = json.dumps(data, indent=2, ensure_ascii=False)
+        
+        from flask import Response
+        return Response(
+            json_data,
+            mimetype="application/json",
+            headers={"Content-Disposition": "attachment;filename=data_backup.json"}
+        )
+        
+    except Exception as e:
+        # If everything fails, return error
+        return jsonify({"error": str(e)}), 500
 
-@app.route('/data.json')
-def raw_json():
-    """Direct access to data.json"""
-    data = get_github_data()
+@app.route('/clear', methods=['POST'])
+def clear_json():
+    """Clear all data"""
+    empty_data = {
+        "tasks": [],
+        "messages": [],
+        "notes": [],
+        "last_id": 0
+    }
+    success = save_data(empty_data)
     
-    if data is None:
-        return jsonify({"error": "No data available"}), 404
-    
-    return jsonify(data)
+    if success:
+        return jsonify({"success": True, "message": "Data cleared from GitHub"})
+    else:
+        return jsonify({"success": False, "error": "Failed to clear from GitHub"})
 
-@app.route('/health')
-def health():
-    """Health check endpoint"""
-    return jsonify({
-        "status": "ok",
-        "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        "github_repo": GITHUB_REPO,
-        "github_connected": get_github_data() is not None
-    })
-
-# ============= TELEGRAM WEBHOOK =============
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Telegram webhook handler"""
-    try:
-        if request.headers.get('content-type') == 'application/json':
+    """Telegram webhook endpoint"""
+    if request.headers.get('content-type') == 'application/json':
+        try:
             json_string = request.get_data().decode('utf-8')
             update = telebot.types.Update.de_json(json_string)
             bot.process_new_updates([update])
             return 'OK', 200
-    except Exception as e:
-        print(f"Webhook error: {e}")
-    return 'Error', 400
+        except Exception as e:
+            print(f"Webhook error: {e}")
+            return 'Error', 500
+    return 'Bad Request', 400
+
+@app.route('/health')
+def health_check():
+    """Health check endpoint"""
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
 # ============= START APPLICATION =============
-def run_bot():
-    """Run Telegram bot"""
-    print("🤖 Starting Telegram bot...")
-    print(f"🌐 Web URL: https://handsome-rafaela-sandip232-7f9d347c.koyeb.app/")
-    print(f"📁 GitHub repo: {GITHUB_REPO}")
+def start_bot():
+    """Start Telegram bot in background"""
+    print("=" * 60)
+    print("🤖 GitHub Task Tracker")
+    print("=" * 60)
+    print("🌐 Web app: https://handsome-rafaela-sandip232-7f9d347c.koyeb.app/")
+    print("📱 Telegram: Send any message to save to GitHub")
+    print("📂 GitHub Repo: https://github.com/Qepheyr/gettingfast")
+    print("💾 Storage: GitHub repository + local backup")
+    print("=" * 60)
+    
+    # Test GitHub connection
+    print("🔗 Testing GitHub connection...")
+    if GITHUB_TOKEN == "YOUR_GITHUB_TOKEN_HERE":
+        print("❌ Please set your GitHub token in the code!")
+    else:
+        test_data = load_from_github()
+        if test_data is not None:
+            print("✅ GitHub connection successful!")
+        else:
+            print("⚠️ GitHub connection failed, using local backup only")
     
     try:
         bot.polling(none_stop=True, interval=1, timeout=30)
     except Exception as e:
-        print(f"Bot error: {e}")
+        print(f"❌ Bot error: {e}")
         import time
         time.sleep(5)
-        run_bot()
+        start_bot()
 
 if __name__ == '__main__':
+    # Create initial local backup if it doesn't exist
+    if not os.path.exists(LOCAL_DATA_FILE):
+        try:
+            with open(LOCAL_DATA_FILE, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "tasks": [],
+                    "messages": [],
+                    "notes": [],
+                    "last_id": 0
+                }, f, indent=2, ensure_ascii=False)
+            print("📁 Created local backup file")
+        except Exception as e:
+            print(f"❌ Could not create local backup: {e}")
+    
     # Start bot in background thread
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread = threading.Thread(target=start_bot, daemon=True)
     bot_thread.start()
     
     # Start Flask app
-    port = int(os.getenv('PORT', 8000))
-    print(f"🚀 Starting web server on port {port}...")
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    print("🚀 Starting web server on port 5000...")
+    print("👉 Web interface: http://localhost:5000")
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)

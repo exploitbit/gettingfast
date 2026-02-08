@@ -1,0 +1,20 @@
+[
+  {
+    "id": 1,
+    "title": "Hwllyg",
+    "description": "now.minutenow.minutenow.minute",
+    "start_time": "2026-02-09 01:40:00",
+    "end_time": "2026-02-09 04:32:00",
+    "notify_enabled": 1,
+    "priority": 9,
+    "repeat": "daily",
+    "repeat_day": null,
+    "repeat_end_date": "",
+    "next_occurrence": "2026-02-09 01:40:00",
+    "completed": 0,
+    "subtasks": [],
+    "last_notified_minute": -1,
+    "bucket": "today",
+    "created_at": "2026-02-09 01:32:43"
+  }
+]

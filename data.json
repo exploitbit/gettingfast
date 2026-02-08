@@ -1,6 +1,16 @@
 {
-  "tasks": [],
+  "tasks": [
+    {
+      "id": 1,
+      "text": "✅ Task Saved to GitHub!\n\n🤖 GitHub Task Tracker\nData saved to GitHub repository\n\nCommands:\n• /add - Add a new task\n• /tasks - View your tasks\n• /download - Download JSON data\n• /clear - Clear all data\n\nHow to use:\n1. Send any message - it will be saved\n2. View data on web interface\n3. Download JSON anytime\n\nStorage:\n✅ GitHub Repository\n📁 Local backup\n\n📅 February 09, 2026\n⏰ 12:24 AM IST\n\nSynced to repository\n\n\n✅ Task Saved to GitHub!\n\n🤖 GitHub Task Tracker\nData saved to GitHub repository\n\nCommands:\n• /add - Add a new task\n• /tasks - View your tasks\n• /download - Download JSON data\n• /clear - Clear all data\n\nHow to use:\n1. Send any message - it will be saved\n2. View data on web interface\n3. Download JSON anytime\n\nStorage:\n✅ GitHub Repository\n📁 Local backup\n\n📅 February 09, 2026\n⏰ 12:24 AM IST\n\nSynced to repository✅ Task Saved to GitHub!\n\n🤖 GitHub Task Tracker\nData saved to GitHub repository\n\nCommands:\n• /add - Add a new task\n• /tasks - View your tasks\n• /download - Download JSON data\n• /clear - Clear all data\n\nHow to use:\n1. Send any message - it will be saved\n2. View data on web interface\n3. Download JSON anytime\n\nStorage:\n✅ GitHub Repository\n📁 Local backup\n\n📅 February 09, 2026\n⏰ 12:24 AM IST\n\nSynced to repository✅ Task Saved to GitHub!\n\n🤖 GitHub Task Tracker\nData saved to GitHub repository\n\nCommands:\n• /add - Add a new task\n• /tasks - View your tasks\n• /download - Download JSON data\n• /clear - Clear all data\n\nHow to use:\n1. Send any message - it will be saved\n2. View data on web interface\n3. Download JSON anytime\n\nStorage:\n✅ GitHub Repository\n📁 Local backup\n\n📅 February 09, 2026\n⏰ 12:24 AM IST\n\nSynced to repository✅ Task Saved to GitHub!\n\n🤖 GitHub Task Tracker\nData saved to GitHub repository\n\nCommands:\n• /add - Add a new task\n• /tasks - View your tasks\n• /download - Download JSON data\n• /clear - Clear all data\n\nHow to use:\n1. Send any message - it will be saved\n2. View data on web interface\n3. Download JSON anytime\n\nStorage:\n✅ GitHub Repository\n📁 Local backup\n\n📅 February 09, 2026\n⏰ 12:24 AM IST\n\nSynced to repository",
+      "timestamp": "2026-02-09 00:24:57",
+      "date": "February 09, 2026",
+      "time": "12:24 AM",
+      "type": "task",
+      "source": "telegram"
+    }
+  ],
   "messages": [],
   "notes": [],
-  "last_id": 0
+  "last_id": 1
 }

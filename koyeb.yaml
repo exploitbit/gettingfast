@@ -1,0 +1,68 @@
+# Koyeb configuration for Telegram Bot
+# Deploy with: koyeb app init telegram-bot --git <your-repo> --config koyeb.yaml
+
+app:
+  name: telegram-bot
+  regions: ["fra"]
+  
+services:
+  - name: web
+    type: web
+    ports:
+      - port: 8000
+        http_path: /
+    routes:
+      - path: /
+    env:
+      - name: BOT_TOKEN
+        value: "8388773187:AAFxz5U8GJ94Wf21VaGvFx9QQSZFU2Rd43I"
+      - name: USER_ID
+        value: "8469993808"
+      - name: WEBHOOK_URL
+        sync: false
+      - name: PLATFORM
+        value: "Koyeb"
+      - name: ADMIN_PASSWORD
+        value: "admin123"
+      - name: PYTHON_VERSION
+        value: "3.11"
+    instance:
+      type: nano
+    scaling:
+      min: 1
+      max: 1
+    build:
+      command: |
+        pip install --upgrade pip
+        pip install -r requirements.txt
+    docker:
+      file: Dockerfile
+    healthcheck:
+      http_path: /health
+      timeout_seconds: 10
+      interval_seconds: 30
+      max_retries: 3
+      restart_delay_seconds: 60
+    
+  # Background worker for scheduled messages
+  - name: scheduler
+    type: worker
+    env:
+      - name: BOT_TOKEN
+        value: "8388773187:AAFxz5U8GJ94Wf21VaGvFx9QQSZFU2Rd43I"
+      - name: USER_ID
+        value: "8469993808"
+      - name: PLATFORM
+        value: "Koyeb Scheduler"
+    instance:
+      type: nano
+    build:
+      command: |
+        pip install --upgrade pip
+        pip install -r requirements.txt
+    command: python scheduler.py
+    cron:
+      # Send message every minute
+      - name: every-minute-message
+        schedule: "* * * * *"
+        command: python -c "import schedule; import time; from scheduler import send_hello; schedule.every(1).minutes.do(send_hello); schedule.run_pending()"

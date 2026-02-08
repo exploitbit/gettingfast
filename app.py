@@ -1,14 +1,12 @@
-
 """
 Task Tracker with Telegram Bot - IST Timezone
-Enhanced UI with GitHub Storage (replaced SQLite)
+Enhanced UI with SQLite Database
 """
 
 import os
-import json
+import sqlite3
 import threading
-import base64
-import requests
+import json
 from datetime import datetime, timedelta
 import pytz
 from flask import Flask, request, Response, render_template_string, jsonify, session, redirect, url_for
@@ -22,17 +20,6 @@ BOT_TOKEN = "8388773187:AAFxz5U8GJ94Wf21VaGvFx9QQSZFU2Rd43I"
 USER_ID = "8469993808"
 SECRET_KEY = secrets.token_hex(32)
 
-# GitHub Configuration
-GITHUB_TOKEN = "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"
-GITHUB_REPO = "Qepheyr/gettingfast"
-GITHUB_FILES = {
-    "tasks": "tasks.json",
-    "history": "history.json",
-    "notes": "notes.json",
-    "settings": "settings.json",
-    "notification_log": "notification_log.json"
-}
-
 # Timezone setup
 IST = pytz.timezone('Asia/Kolkata')
 
@@ -41,164 +28,150 @@ app = Flask(__name__)
 app.secret_key = SECRET_KEY
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# ============= GITHUB HELPER FUNCTIONS =============
-def load_from_github(file_key):
-    """Load data from GitHub for a specific file"""
-    try:
-        file_path = GITHUB_FILES[file_key]
-        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
-        headers = {
-            "Authorization": f"token {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github.v3+json"
-        }
-        
-        response = requests.get(url, headers=headers)
-        
-        if response.status_code == 200:
-            content = response.json()["content"]
-            decoded = base64.b64decode(content).decode('utf-8')
-            return json.loads(decoded)
-        elif response.status_code == 404:
-            # File doesn't exist yet, return default
-            return get_default_data(file_key)
+# ============= DATABASE SETUP =============
+def init_db():
+    """Initialize SQLite database with all required tables"""
+    conn = sqlite3.connect('tasks.db')
+    c = conn.cursor()
+    
+    # Tasks table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            start_time DATETIME NOT NULL,
+            end_time DATETIME NOT NULL,
+            completed INTEGER DEFAULT 0,
+            notify_enabled INTEGER DEFAULT 1,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_notified_minute INTEGER DEFAULT -1,
+            priority INTEGER DEFAULT 15,
+            repeat TEXT DEFAULT 'none',
+            repeat_day TEXT DEFAULT NULL,
+            repeat_end_date DATETIME DEFAULT NULL,
+            next_occurrence DATETIME DEFAULT NULL,
+            bucket TEXT DEFAULT 'today'
+        )
+    ''')
+    
+    # Subtasks table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS subtasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            completed INTEGER DEFAULT 0,
+            priority INTEGER DEFAULT 15,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (task_id) REFERENCES tasks (id) ON DELETE CASCADE
+        )
+    ''')
+    
+    # History table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER,
+            title TEXT,
+            description TEXT,
+            type TEXT DEFAULT 'task',
+            bucket TEXT DEFAULT 'today',
+            repeat TEXT DEFAULT 'none',
+            completed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            time_range TEXT,
+            priority INTEGER DEFAULT 15,
+            FOREIGN KEY (task_id) REFERENCES tasks (id)
+        )
+    ''')
+    
+    # History subtasks table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS history_subtasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            history_id INTEGER,
+            title TEXT,
+            description TEXT,
+            priority INTEGER DEFAULT 15,
+            FOREIGN KEY (history_id) REFERENCES history (id) ON DELETE CASCADE
+        )
+    ''')
+    
+    # Notes table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            priority INTEGER DEFAULT 1,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            notify_enabled INTEGER DEFAULT 0,
+            notify_interval INTEGER DEFAULT 0,
+            last_notified DATETIME DEFAULT NULL
+        )
+    ''')
+    
+    # Settings table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+    
+    # Insert default settings
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('hourly_report', '1')")
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('half_hourly_report', '1')")
+    
+    # Notification log table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS notification_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message TEXT,
+            success INTEGER DEFAULT 1,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ============= DATABASE HELPER FUNCTIONS =============
+def get_db():
+    """Get database connection"""
+    conn = sqlite3.connect('tasks.db')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def db_query(query, params=(), fetch_one=False, fetch_all=False):
+    """Execute database query"""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(query, params)
+    
+    if query.strip().upper().startswith('SELECT'):
+        if fetch_one:
+            result = cursor.fetchone()
+        elif fetch_all:
+            result = cursor.fetchall()
         else:
-            print(f"GitHub API Error for {file_key}: {response.status_code}")
-            return get_default_data(file_key)
-    except Exception as e:
-        print(f"Error loading {file_key} from GitHub: {e}")
-        return get_default_data(file_key)
-
-def save_to_github(file_key, data):
-    """Save data to GitHub for a specific file"""
-    try:
-        file_path = GITHUB_FILES[file_key]
-        
-        # First, get the current file to get SHA (for update)
-        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
-        headers = {
-            "Authorization": f"token {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github.v3+json"
-        }
-        
-        get_response = requests.get(url, headers=headers)
-        sha = None
-        
-        if get_response.status_code == 200:
-            sha = get_response.json()["sha"]
-        
-        # Prepare content
-        content = json.dumps(data, indent=2, ensure_ascii=False)
-        encoded = base64.b64encode(content.encode('utf-8')).decode('utf-8')
-        
-        # Create payload
-        payload = {
-            "message": f"Update {file_key} data - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            "content": encoded,
-            "branch": "main"
-        }
-        
-        if sha:
-            payload["sha"] = sha
-        
-        # Make request
-        response = requests.put(url, headers=headers, json=payload)
-        
-        if response.status_code in [200, 201]:
-            print(f"✅ Successfully saved {file_key} to GitHub")
-            return True
-        else:
-            print(f"❌ GitHub save error for {file_key}: {response.status_code} - {response.text}")
-            return False
-            
-    except Exception as e:
-        print(f"❌ Error saving {file_key} to GitHub: {e}")
-        return False
-
-def get_default_data(file_key):
-    """Get default data structure for each file type"""
-    defaults = {
-        "tasks": [],
-        "history": [],
-        "notes": [],
-        "settings": {"hourly_report": "1", "half_hourly_report": "1"},
-        "notification_log": []
-    }
-    return defaults.get(file_key, [])
-
-def load_data(file_key):
-    """Load data with fallback to local backup"""
-    data = load_from_github(file_key)
+            result = cursor.fetchall()
+    else:
+        conn.commit()
+        result = cursor.lastrowid
     
-    # Save local backup
-    try:
-        local_file = f"{file_key}_backup.json"
-        with open(local_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"⚠️ Could not save local backup for {file_key}: {e}")
-    
-    return data
+    conn.close()
+    return result
 
-def save_data(file_key, data):
-    """Save data to GitHub with local backup"""
-    success = save_to_github(file_key, data)
-    
-    # Always save local backup
-    try:
-        local_file = f"{file_key}_backup.json"
-        with open(local_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"⚠️ Could not save local backup for {file_key}: {e}")
-    
-    return success
-
-def get_next_id(items):
-    """Get next ID for a list of items"""
-    if not items:
-        return 1
-    return max(item.get('id', 0) for item in items) + 1
-
-# ============= DATA ACCESS FUNCTIONS =============
-def get_all_tasks():
-    """Get all tasks from GitHub"""
-    return load_data("tasks")
-
-def save_tasks(tasks):
-    """Save tasks to GitHub"""
-    return save_data("tasks", tasks)
-
-def get_all_history():
-    """Get all history from GitHub"""
-    return load_data("history")
-
-def save_history(history):
-    """Save history to GitHub"""
-    return save_data("history", history)
-
-def get_all_notes():
-    """Get all notes from GitHub"""
-    return load_data("notes")
-
-def save_notes(notes):
-    """Save notes to GitHub"""
-    return save_data("notes", notes)
-
-def get_settings():
-    """Get settings from GitHub"""
-    return load_data("settings")
-
-def save_settings(settings):
-    """Save settings to GitHub"""
-    return save_data("settings", settings)
-
-def get_notification_log():
-    """Get notification log from GitHub"""
-    return load_data("notification_log")
-
-def save_notification_log(log):
-    """Save notification log to GitHub"""
-    return save_data("notification_log", log)
+def row_to_dict(row):
+    """Convert sqlite3.Row to dictionary"""
+    if row is None:
+        return None
+    return dict(row)
 
 # ============= TIME FUNCTIONS =============
 def get_ist_time():
@@ -234,15 +207,11 @@ def send_telegram_message(text, chat_id=USER_ID):
         return False
 
 def log_notification(message, success):
-    """Log notification to GitHub"""
-    log = get_notification_log()
-    log.append({
-        "id": get_next_id(log),
-        "message": message[:500],
-        "success": 1 if success else 0,
-        "created_at": get_ist_time().strftime('%Y-%m-%d %H:%M:%S')
-    })
-    save_notification_log(log)
+    """Log notification to database"""
+    db_query(
+        "INSERT INTO notification_log (message, success) VALUES (?, ?)",
+        (message[:500], 1 if success else 0)
+    )
 
 # ============= NOTIFICATION SYSTEM =============
 def check_and_send_notifications():
@@ -252,23 +221,25 @@ def check_and_send_notifications():
         print(f"⏰ Notification check at {now.strftime('%H:%M:%S')} IST")
         
         # Get active tasks with notifications enabled
-        tasks = get_all_tasks()
-        active_tasks = [task for task in tasks 
-                       if not task.get('completed', False) 
-                       and task.get('notify_enabled', True)]
+        tasks = db_query('''
+            SELECT * FROM tasks 
+            WHERE completed = 0 
+            AND notify_enabled = 1
+            AND datetime(start_time) > datetime('now', '-1 hour')
+            ORDER BY start_time
+        ''', fetch_all=True)
         
-        print(f"📋 Found {len(active_tasks)} active tasks")
+        print(f"📋 Found {len(tasks)} active tasks")
         
-        for task in active_tasks:
+        for task_row in tasks:
             try:
-                task_id = task.get('id')
-                task_title = task.get('title', 'Untitled')
-                start_time_str = task.get('start_time')
-                
-                if not start_time_str:
+                task = row_to_dict(task_row)
+                if not task:
                     continue
                     
-                start_time = datetime.strptime(start_time_str, '%Y-%m-%d %H:%M:%S')
+                task_id = task['id']
+                task_title = task['title']
+                start_time = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
                 start_time = IST.localize(start_time)
                 
                 # Calculate minutes until task starts
@@ -290,23 +261,20 @@ def check_and_send_notifications():
                         message += f"\n📅 {start_time.strftime('%I:%M %p')} IST"
                         
                         if send_telegram_message(message):
-                            # Update last_notified_minute in task
-                            tasks = get_all_tasks()
-                            for t in tasks:
-                                if t.get('id') == task_id:
-                                    t['last_notified_minute'] = minutes_until_start
-                                    break
-                            save_tasks(tasks)
+                            db_query('''
+                                UPDATE tasks 
+                                SET last_notified_minute = ? 
+                                WHERE id = ?
+                            ''', (minutes_until_start, task_id))
                             print(f"   ✅ Sent notification: {minutes_until_start} minutes before")
                 
                 # Reset notification counter if task has passed
                 elif minutes_until_start <= 0 and task.get('last_notified_minute', -1) != 0:
-                    tasks = get_all_tasks()
-                    for t in tasks:
-                        if t.get('id') == task_id:
-                            t['last_notified_minute'] = 0
-                            break
-                    save_tasks(tasks)
+                    db_query('''
+                        UPDATE tasks 
+                        SET last_notified_minute = 0 
+                        WHERE id = ?
+                    ''', (task_id,))
                     print(f"   🔄 Reset notifications for task {task_id}")
                     
             except Exception as e:
@@ -324,16 +292,18 @@ def send_half_hourly_report():
         today = now.strftime('%Y-%m-%d')
         
         # Get today's tasks
-        tasks = get_all_tasks()
-        today_tasks = [task for task in tasks 
-                      if task.get('start_time', '').startswith(today)]
+        tasks = db_query('''
+            SELECT * FROM tasks 
+            WHERE date(start_time) = ?
+            ORDER BY start_time
+        ''', (today,), fetch_all=True)
         
         # Get setting
-        settings = get_settings()
-        if settings.get('half_hourly_report') != '1':
+        setting = db_query("SELECT value FROM settings WHERE key = 'half_hourly_report'", fetch_one=True)
+        if not setting or setting['value'] != '1':
             return
         
-        if not today_tasks:
+        if not tasks:
             message = "━━━━━━━━━━━━━━━━━━━━\n"
             message += "📊 <b>30-Minute Report</b>\n"
             message += "━━━━━━━━━━━━━━━━━━━━\n"
@@ -341,8 +311,8 @@ def send_half_hourly_report():
             message += f"📅 Date: {now.strftime('%B %d, %Y')}\n"
             message += "✅ <i>No active tasks for today!</i>"
         else:
-            completed = sum(1 for t in today_tasks if t.get('completed', False))
-            total = len(today_tasks)
+            completed = sum(1 for t in tasks if t['completed'])
+            total = len(tasks)
             
             message = "━━━━━━━━━━━━━━━━━━━━\n"
             message += "📊 <b>30-Minute Report</b>\n"
@@ -351,21 +321,21 @@ def send_half_hourly_report():
             message += f"📅 Date: {now.strftime('%B %d, %Y')}\n"
             message += f"📋 Tasks: {completed}/{total} completed\n\n"
             
-            for task in today_tasks:
-                status = "✅" if task.get('completed', False) else "⏳"
-                start_time = datetime.strptime(task.get('start_time', ''), '%Y-%m-%d %H:%M:%S')
+            for task in tasks:
+                status = "✅" if task['completed'] else "⏳"
+                start_time = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
                 start_time = IST.localize(start_time)
-                end_time = datetime.strptime(task.get('end_time', ''), '%Y-%m-%d %H:%M:%S')
+                end_time = datetime.strptime(task['end_time'], '%Y-%m-%d %H:%M:%S')
                 end_time = IST.localize(end_time)
                 
                 # Get subtask progress
-                subtasks = task.get('subtasks', [])
-                completed_subtasks = sum(1 for st in subtasks if st.get('completed', False))
+                subtasks = db_query('SELECT * FROM subtasks WHERE task_id = ?', (task['id'],), fetch_all=True)
+                completed_subtasks = sum(1 for st in subtasks if st['completed'])
                 total_subtasks = len(subtasks)
                 
                 progress = f" ({completed_subtasks}/{total_subtasks})" if total_subtasks > 0 else ""
                 
-                message += f"{status} <b>{task.get('title', 'Untitled')}</b>{progress}\n"
+                message += f"{status} <b>{task['title']}</b>{progress}\n"
                 message += f"   ⏰ {start_time.strftime('%I:%M')} - {end_time.strftime('%I:%M %p')}\n"
         
         send_telegram_message(message)
@@ -378,15 +348,16 @@ def check_note_notifications():
     try:
         now = get_ist_time()
         
-        notes = get_all_notes()
-        notes_to_notify = [note for note in notes 
-                          if note.get('notify_enabled', False) 
-                          and note.get('notify_interval', 0) > 0]
+        notes = db_query('''
+            SELECT * FROM notes 
+            WHERE notify_enabled = 1 
+            AND notify_interval > 0
+        ''', fetch_all=True)
         
-        for note in notes_to_notify:
-            note_id = note.get('id')
-            interval_hours = note.get('notify_interval', 0)
-            last_notified = note.get('last_notified')
+        for note in notes:
+            note_id = note['id']
+            interval_hours = note['notify_interval']
+            last_notified = note['last_notified']
             
             should_notify = False
             
@@ -402,24 +373,21 @@ def check_note_notifications():
                 message = "━━━━━━━━━━━━━━━━━━━━\n"
                 message += f"📝 <b>Note Reminder</b>\n"
                 message += "━━━━━━━━━━━━━━━━━━━━\n"
-                message += f"📌 <b>{note.get('title', 'Untitled')}</b>\n"
+                message += f"📌 <b>{note['title']}</b>\n"
                 message += f"🔄 Interval: Every {interval_hours} hours\n"
                 message += f"⏰ Time: {now.strftime('%I:%M %p')} IST\n"
                 
-                if note.get('description'):
+                if note['description']:
                     desc = note['description'][:200]
                     if len(note['description']) > 200:
                         desc += "..."
                     message += f"\n<blockquote>{desc}</blockquote>"
                 
                 if send_telegram_message(message):
-                    # Update last_notified
-                    notes = get_all_notes()
-                    for n in notes:
-                        if n.get('id') == note_id:
-                            n['last_notified'] = now.strftime('%Y-%m-%d %H:%M:%S')
-                            break
-                    save_notes(notes)
+                    db_query(
+                        "UPDATE notes SET last_notified = ? WHERE id = ?",
+                        (now.strftime('%Y-%m-%d %H:%M:%S'), note_id)
+                    )
                     
     except Exception as e:
         print(f"❌ Note notification error: {e}")
@@ -538,14 +506,16 @@ def send_today_tasks_callback(chat_id, message_id):
     """Send today's tasks via callback"""
     now = get_ist_time()
     today = now.strftime('%Y-%m-%d')
-    tasks = get_all_tasks()
-    today_tasks = [task for task in tasks 
-                  if task.get('start_time', '').startswith(today)]
+    tasks = db_query('''
+        SELECT * FROM tasks 
+        WHERE date(start_time) = ?
+        ORDER BY start_time
+    ''', (today,), fetch_all=True)
     
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("🔙 Back", callback_data='back_to_main'))
     
-    if not today_tasks:
+    if not tasks:
         response = "━━━━━━━━━━━━━━━━━━━━\n"
         response += "📅 <b>Today's Tasks</b>\n"
         response += "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -562,21 +532,21 @@ def send_today_tasks_callback(chat_id, message_id):
     response += f"📅 Date: {now.strftime('%B %d, %Y')}\n"
     response += f"⏰ Time: {now.strftime('%I:%M %p')} IST\n\n"
     
-    for task in today_tasks:
-        status = "✅" if task.get('completed', False) else "⏳"
-        start_time = datetime.strptime(task.get('start_time', ''), '%Y-%m-%d %H:%M:%S')
+    for task in tasks:
+        status = "✅" if task['completed'] else "⏳"
+        start_time = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
         start_time = IST.localize(start_time)
-        end_time = datetime.strptime(task.get('end_time', ''), '%Y-%m-%d %H:%M:%S')
+        end_time = datetime.strptime(task['end_time'], '%Y-%m-%d %H:%M:%S')
         end_time = IST.localize(end_time)
         
         # Get subtask progress
-        subtasks = task.get('subtasks', [])
-        completed_subtasks = sum(1 for st in subtasks if st.get('completed', False))
+        subtasks = db_query('SELECT * FROM subtasks WHERE task_id = ?', (task['id'],), fetch_all=True)
+        completed_subtasks = sum(1 for st in subtasks if st['completed'])
         total_subtasks = len(subtasks)
         
         progress = f" ({completed_subtasks}/{total_subtasks})" if total_subtasks > 0 else ""
         
-        response += f"{status} <b>{task.get('title', 'Untitled')}</b>{progress}\n"
+        response += f"{status} <b>{task['title']}</b>{progress}\n"
         response += f"   ⏰ {start_time.strftime('%I:%M')} - {end_time.strftime('%I:%M %p')}\n\n"
     
     bot.edit_message_text(response, chat_id, message_id, parse_mode='HTML', reply_markup=keyboard)
@@ -636,14 +606,16 @@ def send_today_tasks(message):
     
     now = get_ist_time()
     today = now.strftime('%Y-%m-%d')
-    tasks = get_all_tasks()
-    today_tasks = [task for task in tasks 
-                  if task.get('start_time', '').startswith(today)]
+    tasks = db_query('''
+        SELECT * FROM tasks 
+        WHERE date(start_time) = ?
+        ORDER BY start_time
+    ''', (today,), fetch_all=True)
     
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("🔙 Back to Menu", callback_data='back_to_main'))
     
-    if not today_tasks:
+    if not tasks:
         response = "━━━━━━━━━━━━━━━━━━━━\n"
         response += "📅 <b>Today's Tasks</b>\n"
         response += "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -660,14 +632,14 @@ def send_today_tasks(message):
     response += f"📅 Date: {now.strftime('%B %d, %Y')}\n"
     response += f"⏰ Time: {now.strftime('%I:%M %p')} IST\n\n"
     
-    for task in today_tasks:
-        status = "✅" if task.get('completed', False) else "⏳"
-        start_time = datetime.strptime(task.get('start_time', ''), '%Y-%m-%d %H:%M:%S')
+    for task in tasks:
+        status = "✅" if task['completed'] else "⏳"
+        start_time = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
         start_time = IST.localize(start_time)
-        end_time = datetime.strptime(task.get('end_time', ''), '%Y-%m-%d %H:%M:%S')
+        end_time = datetime.strptime(task['end_time'], '%Y-%m-%d %H:%M:%S')
         end_time = IST.localize(end_time)
         
-        response += f"{status} <b>{task.get('title', 'Untitled')}</b>\n"
+        response += f"{status} <b>{task['title']}</b>\n"
         response += f"   ⏰ {start_time.strftime('%I:%M')} - {end_time.strftime('%I:%M %p')}\n\n"
     
     bot.reply_to(message, response, parse_mode='HTML', reply_markup=keyboard)
@@ -693,11 +665,13 @@ def send_daily_summary():
         today = now.strftime('%Y-%m-%d')
         
         # Get today's tasks
-        tasks = get_all_tasks()
-        today_tasks = [task for task in tasks 
-                      if task.get('start_time', '').startswith(today)]
+        tasks = db_query('''
+            SELECT * FROM tasks 
+            WHERE date(start_time) = ?
+            ORDER BY start_time
+        ''', (today,), fetch_all=True)
         
-        if not today_tasks:
+        if not tasks:
             message = "━━━━━━━━━━━━━━━━━━━━\n"
             message += "📊 <b>Daily Summary</b>\n"
             message += "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -707,8 +681,8 @@ def send_daily_summary():
             send_telegram_message(message)
             return
         
-        completed = sum(1 for t in today_tasks if t.get('completed', False))
-        total = len(today_tasks)
+        completed = sum(1 for t in tasks if t['completed'])
+        total = len(tasks)
         
         message = "━━━━━━━━━━━━━━━━━━━━\n"
         message += "📊 <b>Daily Summary</b>\n"
@@ -717,11 +691,11 @@ def send_daily_summary():
         message += f"⏰ Time: {now.strftime('%I:%M %p')} IST\n"
         message += f"📋 Tasks: <b>{completed}/{total}</b> completed\n\n"
         
-        for task in today_tasks:
-            status = "✅" if task.get('completed', False) else "⏳"
-            start_time = datetime.strptime(task.get('start_time', ''), '%Y-%m-%d %H:%M:%S')
+        for task in tasks:
+            status = "✅" if task['completed'] else "⏳"
+            start_time = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
             start_time = IST.localize(start_time)
-            message += f"{status} <b>{task.get('title', 'Untitled')}</b> ({start_time.strftime('%I:%M %p')})\n"
+            message += f"{status} <b>{task['title']}</b> ({start_time.strftime('%I:%M %p')})\n"
         
         send_telegram_message(message)
         
@@ -876,101 +850,128 @@ def index():
     today = now.strftime('%Y-%m-%d')
     
     # Get tasks for today
-    all_tasks = get_all_tasks()
-    tasks = [task for task in all_tasks 
-            if task.get('start_time', '').startswith(today)]
+    tasks = db_query('''
+        SELECT * FROM tasks 
+        WHERE date(start_time) = ?
+        ORDER BY start_time
+    ''', (today,), fetch_all=True)
     
     # Get all tasks for stats
-    all_tasks_list = all_tasks
+    all_tasks = db_query('SELECT * FROM tasks', fetch_all=True)
     
     # Get history
-    history = get_all_history()
+    history = db_query('''
+        SELECT h.* 
+        FROM history h
+        ORDER BY h.completed_at DESC
+        LIMIT 20
+    ''', fetch_all=True)
+    
+    # Get history subtasks
+    history_with_subtasks = []
+    for item in history:
+        item_dict = row_to_dict(item)
+        if item_dict:
+            subtasks = db_query('''
+                SELECT * FROM history_subtasks 
+                WHERE history_id = ?
+            ''', (item_dict['id'],), fetch_all=True)
+            item_dict['subtasks'] = [row_to_dict(st) for st in subtasks]
+            history_with_subtasks.append(item_dict)
     
     # Get notes
-    notes = get_all_notes()
-    notes_sorted = sorted(notes, key=lambda x: x.get('priority', 1))
+    notes = db_query('SELECT * FROM notes ORDER BY priority', fetch_all=True)
     
     # Get settings
-    settings = get_settings()
+    settings = {}
+    setting_rows = db_query("SELECT key, value FROM settings", fetch_all=True)
+    for row in setting_rows:
+        row_dict = row_to_dict(row)
+        if row_dict:
+            settings[row_dict['key']] = row_dict['value']
     
     # Calculate stats
-    completed_today = sum(1 for t in tasks if t.get('completed', False))
+    completed_today = sum(1 for t in tasks if t['completed'])
     pending_today = len(tasks) - completed_today
     
     # Process tasks for display
     processed_tasks = []
     for task in tasks:
+        task_dict = row_to_dict(task)
+        if not task_dict:
+            continue
+            
         # Get subtasks
-        subtasks = task.get('subtasks', [])
-        completed_subtasks = sum(1 for st in subtasks if st.get('completed', False))
+        subtasks = db_query('''
+            SELECT * FROM subtasks 
+            WHERE task_id = ?
+            ORDER BY priority
+        ''', (task_dict['id'],), fetch_all=True)
+        
+        completed_subtasks = sum(1 for st in subtasks if st['completed'])
         total_subtasks = len(subtasks)
         progress_percentage = round((completed_subtasks / total_subtasks * 100)) if total_subtasks > 0 else 0
         
         # Format times
-        start_dt = datetime.strptime(task.get('start_time', ''), '%Y-%m-%d %H:%M:%S')
+        start_dt = datetime.strptime(task_dict['start_time'], '%Y-%m-%d %H:%M:%S')
         start_dt = IST.localize(start_dt)
-        end_dt = datetime.strptime(task.get('end_time', ''), '%Y-%m-%d %H:%M:%S')
+        end_dt = datetime.strptime(task_dict['end_time'], '%Y-%m-%d %H:%M:%S')
         end_dt = IST.localize(end_dt)
         
         # Calculate time status
         time_info = calculate_time_status(
-            task.get('start_time', ''),
-            task.get('end_time', ''),
-            not task.get('completed', False),
-            task.get('completed', False)
+            task_dict['start_time'],
+            task_dict['end_time'],
+            not task_dict['completed'],
+            task_dict['completed']
         )
         
         processed_tasks.append({
-            'id': task.get('id'),
-            'title': task.get('title', 'Untitled'),
-            'description': task.get('description', ''),
-            'start_time': task.get('start_time', ''),
-            'end_time': task.get('end_time', ''),
+            'id': task_dict['id'],
+            'title': task_dict['title'],
+            'description': task_dict['description'],
+            'start_time': task_dict['start_time'],
+            'end_time': task_dict['end_time'],
             'start_display': start_dt.strftime('%I:%M %p'),
             'end_display': end_dt.strftime('%I:%M %p'),
             'date_range': start_dt.strftime('%b %d'),
             'time_range': f"{start_dt.strftime('%I:%M %p')} - {end_dt.strftime('%I:%M %p')}",
-            'completed': task.get('completed', False),
-            'notify_enabled': task.get('notify_enabled', True),
-            'priority': task.get('priority', 15),
-            'repeat': task.get('repeat', 'none'),
-            'repeat_day': task.get('repeat_day'),
-            'subtasks': subtasks,
+            'completed': task_dict['completed'],
+            'notify_enabled': task_dict['notify_enabled'],
+            'priority': task_dict['priority'],
+            'repeat': task_dict['repeat'],
+            'repeat_day': task_dict['repeat_day'],
+            'subtasks': [row_to_dict(st) for st in subtasks],
             'completed_subtasks': completed_subtasks,
             'total_subtasks': total_subtasks,
             'progress_percentage': progress_percentage,
             'time_status': time_info,
-            'is_active': not task.get('completed', False),
-            'is_completed_repeating': task.get('repeat', 'none') != 'none' and task.get('completed', False),
-            'bucket': task.get('bucket', 'today')
+            'is_active': not task_dict['completed'],
+            'is_completed_repeating': task_dict['repeat'] != 'none' and task_dict['completed']
         })
     
     # Process notes for display
     processed_notes = []
-    for note in notes_sorted:
-        created_at = datetime.strptime(note.get('created_at', now.strftime('%Y-%m-%d %H:%M:%S')), '%Y-%m-%d %H:%M:%S')
-        created_at = IST.localize(created_at)
-        updated_at = datetime.strptime(note.get('updated_at', now.strftime('%Y-%m-%d %H:%M:%S')), '%Y-%m-%d %H:%M:%S')
-        updated_at = IST.localize(updated_at)
-        
-        processed_notes.append({
-            'id': note.get('id'),
-            'title': note.get('title', 'Untitled'),
-            'description': note.get('description', ''),
-            'priority': note.get('priority', 1),
-            'created_at': note.get('created_at', ''),
-            'updated_at': note.get('updated_at', ''),
-            'created_display': created_at.strftime('%b %d, %Y'),
-            'updated_display': updated_at.strftime('%b %d, %Y'),
-            'notify_enabled': note.get('notify_enabled', False),
-            'notify_interval': note.get('notify_interval', 0)
-        })
-    
-    # Process history for display
-    history_with_subtasks = []
-    for item in history[:20]:  # Limit to 20 items
-        item['subtasks'] = item.get('subtasks', [])
-        history_with_subtasks.append(item)
+    for note in notes:
+        note_dict = row_to_dict(note)
+        if note_dict:
+            created_at = datetime.strptime(note_dict['created_at'], '%Y-%m-%d %H:%M:%S')
+            created_at = IST.localize(created_at)
+            updated_at = datetime.strptime(note_dict['updated_at'], '%Y-%m-%d %H:%M:%S')
+            updated_at = IST.localize(updated_at)
+            
+            processed_notes.append({
+                'id': note_dict['id'],
+                'title': note_dict['title'],
+                'description': note_dict['description'],
+                'priority': note_dict['priority'],
+                'created_at': note_dict['created_at'],
+                'updated_at': note_dict['updated_at'],
+                'created_display': created_at.strftime('%b %d, %Y'),
+                'updated_display': updated_at.strftime('%b %d, %Y'),
+                'notify_enabled': note_dict['notify_enabled'],
+                'notify_interval': note_dict['notify_interval']
+            })
     
     # Render the HTML template
     return render_template_string('''
@@ -1961,7 +1962,7 @@ def index():
                     
                     <div class="settings-item">
                         <span class="settings-label">Total Tasks</span>
-                        <span class="settings-value">{{ all_tasks_list|length }}</span>
+                        <span class="settings-value">{{ all_tasks|length }}</span>
                     </div>
                     
                     <div class="settings-item">
@@ -2580,7 +2581,7 @@ def index():
     USER_ID=USER_ID,
     completed_today=completed_today,
     pending_today=pending_today,
-    all_tasks_list=all_tasks_list,
+    all_tasks=all_tasks,
     notes=notes,
     format_text=format_text,
     python_version='3.x',
@@ -2602,6 +2603,7 @@ def add_task():
     # For weekly repeat, get the day from the current date
     repeat_day = None
     if repeat == 'weekly':
+        from datetime import datetime
         now = get_ist_time()
         repeat_day = now.strftime('%A')  # Gets day name like "Monday"
     
@@ -2622,32 +2624,15 @@ def add_task():
     start_datetime = start_dt.strftime('%Y-%m-%d %H:%M:%S')
     end_datetime = end_dt.strftime('%Y-%m-%d %H:%M:%S')
     
-    # Get all tasks
-    tasks = get_all_tasks()
-    
-    # Create new task
-    new_task = {
-        'id': get_next_id(tasks),
-        'title': title,
-        'description': description,
-        'start_time': start_datetime,
-        'end_time': end_datetime,
-        'completed': False,
-        'notify_enabled': notify_enabled,
-        'created_at': get_ist_time().strftime('%Y-%m-%d %H:%M:%S'),
-        'last_notified_minute': -1,
-        'priority': priority,
-        'repeat': repeat,
-        'repeat_day': repeat_day,
-        'repeat_end_date': repeat_end_date,
-        'next_occurrence': start_datetime if repeat != 'none' else None,
-        'bucket': 'today',
-        'subtasks': []
-    }
-    
-    # Add task
-    tasks.append(new_task)
-    save_tasks(tasks)
+    # Insert task
+    task_id = db_query(
+        """INSERT INTO tasks (title, description, start_time, end_time, notify_enabled, 
+           priority, repeat, repeat_day, repeat_end_date, next_occurrence) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (title, description, start_datetime, end_datetime, notify_enabled, 
+         priority, repeat, repeat_day, repeat_end_date, 
+         start_datetime if repeat != 'none' else None)
+    )
     
     # Send notification if enabled and starting soon
     if notify_enabled:
@@ -2673,37 +2658,25 @@ def add_subtask():
     if not session.get('logged_in'):
         return redirect(url_for('index'))
     
-    task_id = int(request.form.get('task_id'))
+    task_id = request.form.get('task_id')
     title = request.form.get('title', '').strip()
     description = request.form.get('description', '').strip()
     
     if task_id and title:
-        # Get all tasks
-        tasks = get_all_tasks()
+        # Get current max priority for this task's subtasks
+        subtasks = db_query(
+            'SELECT priority FROM subtasks WHERE task_id = ? ORDER BY priority DESC LIMIT 1',
+            (task_id,), fetch_one=True
+        )
         
-        # Find the task
-        for task in tasks:
-            if task.get('id') == task_id:
-                # Get current max priority for subtasks
-                subtasks = task.get('subtasks', [])
-                priority = 1
-                if subtasks:
-                    priority = max(st.get('priority', 0) for st in subtasks) + 1
-                
-                # Create new subtask
-                new_subtask = {
-                    'id': get_next_id(subtasks),
-                    'title': title,
-                    'description': description,
-                    'completed': False,
-                    'priority': priority
-                }
-                
-                # Add subtask
-                task['subtasks'].append(new_subtask)
-                break
+        priority = 1
+        if subtasks and subtasks['priority']:
+            priority = subtasks['priority'] + 1
         
-        save_tasks(tasks)
+        db_query(
+            "INSERT INTO subtasks (task_id, title, description, priority) VALUES (?, ?, ?, ?)",
+            (task_id, title, description, priority)
+        )
     
     return redirect(url_for('index', view='tasks'))
 
@@ -2713,65 +2686,53 @@ def complete_task():
     if not session.get('logged_in'):
         return redirect(url_for('index'))
     
-    task_id = int(request.form.get('task_id'))
+    task_id = request.form.get('task_id')
     
     if task_id:
-        # Get all tasks
-        tasks = get_all_tasks()
+        task = db_query("SELECT * FROM tasks WHERE id = ?", (task_id,), fetch_one=True)
         
-        for task in tasks:
-            if task.get('id') == task_id and not task.get('completed', False):
-                # Mark task as completed
-                task['completed'] = True
-                
-                # Get task time range for history
-                start_dt = datetime.strptime(task.get('start_time', ''), '%Y-%m-%d %H:%M:%S')
-                start_dt = IST.localize(start_dt)
-                end_dt = datetime.strptime(task.get('end_time', ''), '%Y-%m-%d %H:%M:%S')
-                end_dt = IST.localize(end_dt)
-                time_range = f"{start_dt.strftime('%I:%M %p')} - {end_dt.strftime('%I:%M %p')}"
-                
-                # Get all history
-                history = get_all_history()
-                
-                # Add to history
-                new_history = {
-                    'id': get_next_id(history),
-                    'task_id': task_id,
-                    'title': task.get('title', ''),
-                    'description': task.get('description', ''),
-                    'type': 'task',
-                    'bucket': task.get('bucket', 'today'),
-                    'repeat': task.get('repeat', 'none'),
-                    'time_range': time_range,
-                    'priority': task.get('priority', 15),
-                    'completed_at': get_ist_time().strftime('%Y-%m-%d %H:%M:%S'),
-                    'subtasks': []
-                }
-                
-                # Add completed subtasks to history
-                for subtask in task.get('subtasks', []):
-                    if subtask.get('completed', False):
-                        new_history['subtasks'].append({
-                            'title': subtask.get('title', ''),
-                            'description': subtask.get('description', ''),
-                            'priority': subtask.get('priority', 15)
-                        })
-                
-                history.append(new_history)
-                save_history(history)
-                save_tasks(tasks)
-                
-                # Send notification
-                now = get_ist_time()
-                message = "━━━━━━━━━━━━━━━━━━━━\n"
-                message += f"🎉 <b>Task Completed!</b>\n"
-                message += "━━━━━━━━━━━━━━━━━━━━\n\n"
-                message += f"✅ <b>{task.get('title', '')}</b>\n"
-                message += f"⏰ {now.strftime('%I:%M %p')} IST\n\n"
-                message += "<i>Great job! Keep it up! 🚀</i>"
-                send_telegram_message(message)
-                break
+        if task and not task['completed']:
+            # Mark task as completed
+            db_query("UPDATE tasks SET completed = 1 WHERE id = ?", (task_id,))
+            
+            # Get task time range for history
+            start_dt = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
+            start_dt = IST.localize(start_dt)
+            end_dt = datetime.strptime(task['end_time'], '%Y-%m-%d %H:%M:%S')
+            end_dt = IST.localize(end_dt)
+            time_range = f"{start_dt.strftime('%I:%M %p')} - {end_dt.strftime('%I:%M %p')}"
+            
+            # Add to history
+            history_id = db_query(
+                """INSERT INTO history (task_id, title, description, type, bucket, 
+                   repeat, time_range, priority) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (task_id, task['title'], task['description'], 'task', task['bucket'], 
+                 task['repeat'], time_range, task['priority'])
+            )
+            
+            # Add completed subtasks to history
+            subtasks = db_query(
+                "SELECT * FROM subtasks WHERE task_id = ? AND completed = 1",
+                (task_id,), fetch_all=True
+            )
+            
+            for subtask in subtasks:
+                db_query(
+                    """INSERT INTO history_subtasks (history_id, title, description, priority) 
+                       VALUES (?, ?, ?, ?)""",
+                    (history_id, subtask['title'], subtask['description'], subtask['priority'])
+                )
+            
+            # Send notification
+            now = get_ist_time()
+            message = "━━━━━━━━━━━━━━━━━━━━\n"
+            message += f"🎉 <b>Task Completed!</b>\n"
+            message += "━━━━━━━━━━━━━━━━━━━━\n\n"
+            message += f"✅ <b>{task['title']}</b>\n"
+            message += f"⏰ {now.strftime('%I:%M %p')} IST\n\n"
+            message += "<i>Great job! Keep it up! 🚀</i>"
+            send_telegram_message(message)
     
     return redirect(url_for('index', view='tasks'))
 
@@ -2781,35 +2742,39 @@ def complete_subtask():
     if not session.get('logged_in'):
         return redirect(url_for('index'))
     
-    task_id = int(request.form.get('task_id'))
-    subtask_id = int(request.form.get('subtask_id'))
+    task_id = request.form.get('task_id')
+    subtask_id = request.form.get('subtask_id')
     
     if task_id and subtask_id:
-        # Get all tasks
-        tasks = get_all_tasks()
+        # Get current completion status
+        subtask = db_query(
+            "SELECT * FROM subtasks WHERE id = ?",
+            (subtask_id,), fetch_one=True
+        )
         
-        for task in tasks:
-            if task.get('id') == task_id:
-                for subtask in task.get('subtasks', []):
-                    if subtask.get('id') == subtask_id:
-                        # Toggle completion
-                        new_status = not subtask.get('completed', False)
-                        subtask['completed'] = new_status
-                        
-                        # Send notification if completed
-                        if new_status:
-                            message = "━━━━━━━━━━━━━━━━━━━━\n"
-                            message += f"✅ <b>Subtask Completed</b>\n"
-                            message += "━━━━━━━━━━━━━━━━━━━━\n\n"
-                            message += f"📝 <b>{subtask.get('title', '')}</b>\n"
-                            message += f"📋 <i>Parent Task:</i> {task.get('title', '')}\n"
-                            message += f"⏰ Time: {get_ist_time().strftime('%I:%M %p')} IST\n\n"
-                            message += "<i>One step closer! 👏</i>"
-                            send_telegram_message(message)
-                        break
-                break
-        
-        save_tasks(tasks)
+        if subtask:
+            new_status = 0 if subtask['completed'] else 1
+            db_query(
+                "UPDATE subtasks SET completed = ? WHERE id = ?",
+                (new_status, subtask_id)
+            )
+            
+            # Send notification if completed
+            if new_status == 1:
+                task = db_query(
+                    "SELECT title FROM tasks WHERE id = ?",
+                    (task_id,), fetch_one=True
+                )
+                
+                message = "━━━━━━━━━━━━━━━━━━━━\n"
+                message += f"✅ <b>Subtask Completed</b>\n"
+                message += "━━━━━━━━━━━━━━━━━━━━\n\n"
+                message += f"📝 <b>{subtask['title']}</b>\n"
+                if task:
+                    message += f"📋 <i>Parent Task:</i> {task['title']}\n"
+                message += f"⏰ Time: {get_ist_time().strftime('%I:%M %p')} IST\n\n"
+                message += "<i>One step closer! 👏</i>"
+                send_telegram_message(message)
     
     return redirect(url_for('index', view='tasks'))
 
@@ -2819,13 +2784,10 @@ def delete_task():
     if not session.get('logged_in'):
         return redirect(url_for('index'))
     
-    task_id = int(request.form.get('task_id'))
+    task_id = request.form.get('task_id')
     
     if task_id:
-        # Get all tasks
-        tasks = get_all_tasks()
-        tasks = [task for task in tasks if task.get('id') != task_id]
-        save_tasks(tasks)
+        db_query("DELETE FROM tasks WHERE id = ?", (task_id,))
     
     return redirect(url_for('index', view='tasks'))
 
@@ -2835,19 +2797,11 @@ def delete_subtask():
     if not session.get('logged_in'):
         return redirect(url_for('index'))
     
-    task_id = int(request.form.get('task_id'))
-    subtask_id = int(request.form.get('subtask_id'))
+    task_id = request.form.get('task_id')
+    subtask_id = request.form.get('subtask_id')
     
     if subtask_id:
-        # Get all tasks
-        tasks = get_all_tasks()
-        
-        for task in tasks:
-            if task.get('id') == task_id:
-                task['subtasks'] = [st for st in task.get('subtasks', []) if st.get('id') != subtask_id]
-                break
-        
-        save_tasks(tasks)
+        db_query("DELETE FROM subtasks WHERE id = ?", (subtask_id,))
     
     return redirect(url_for('index', view='tasks'))
 
@@ -2863,29 +2817,21 @@ def add_note():
     notify_interval = int(request.form.get('notify_interval', 12))
     
     if title:
-        # Get all notes
-        notes = get_all_notes()
-        
         # Get max priority
+        notes = db_query(
+            "SELECT priority FROM notes ORDER BY priority DESC LIMIT 1",
+            fetch_one=True
+        )
+        
         priority = 1
-        if notes:
-            priority = max(note.get('priority', 0) for note in notes) + 1
+        if notes and notes['priority']:
+            priority = notes['priority'] + 1
         
-        # Create new note
-        new_note = {
-            'id': get_next_id(notes),
-            'title': title,
-            'description': description,
-            'priority': priority,
-            'created_at': get_ist_time().strftime('%Y-%m-%d %H:%M:%S'),
-            'updated_at': get_ist_time().strftime('%Y-%m-%d %H:%M:%S'),
-            'notify_enabled': notify_enabled,
-            'notify_interval': notify_interval,
-            'last_notified': None
-        }
-        
-        notes.append(new_note)
-        save_notes(notes)
+        db_query(
+            """INSERT INTO notes (title, description, priority, notify_enabled, notify_interval) 
+               VALUES (?, ?, ?, ?, ?)""",
+            (title, description, priority, notify_enabled, notify_interval)
+        )
         
         # Send notification if enabled
         if notify_enabled and notify_interval > 0:
@@ -2905,26 +2851,19 @@ def update_note():
     if not session.get('logged_in'):
         return redirect(url_for('index'))
     
-    note_id = int(request.form.get('note_id'))
+    note_id = request.form.get('note_id')
     title = request.form.get('title', '').strip()
     description = request.form.get('description', '').strip()
     notify_enabled = 1 if request.form.get('notify_enabled') == 'on' else 0
     notify_interval = int(request.form.get('notify_interval', 12))
     
     if note_id and title:
-        # Get all notes
-        notes = get_all_notes()
-        
-        for note in notes:
-            if note.get('id') == note_id:
-                note['title'] = title
-                note['description'] = description
-                note['notify_enabled'] = notify_enabled
-                note['notify_interval'] = notify_interval
-                note['updated_at'] = get_ist_time().strftime('%Y-%m-%d %H:%M:%S')
-                break
-        
-        save_notes(notes)
+        db_query(
+            """UPDATE notes SET title = ?, description = ?, notify_enabled = ?, 
+               notify_interval = ?, updated_at = CURRENT_TIMESTAMP 
+               WHERE id = ?""",
+            (title, description, notify_enabled, notify_interval, note_id)
+        )
     
     return redirect(url_for('index', view='notes'))
 
@@ -2934,13 +2873,10 @@ def delete_note():
     if not session.get('logged_in'):
         return redirect(url_for('index'))
     
-    note_id = int(request.form.get('note_id'))
+    note_id = request.form.get('note_id')
     
     if note_id:
-        # Get all notes
-        notes = get_all_notes()
-        notes = [note for note in notes if note.get('id') != note_id]
-        save_notes(notes)
+        db_query("DELETE FROM notes WHERE id = ?", (note_id,))
     
     return redirect(url_for('index', view='notes'))
 
@@ -2950,33 +2886,46 @@ def move_note():
     if not session.get('logged_in'):
         return redirect(url_for('index'))
     
-    note_id = int(request.form.get('note_id'))
+    note_id = request.form.get('note_id')
     direction = request.form.get('direction')
     
     if note_id and direction:
-        # Get all notes
-        notes = get_all_notes()
+        # Get current note
+        note = db_query(
+            "SELECT id, priority FROM notes WHERE id = ?",
+            (note_id,), fetch_one=True
+        )
         
-        # Find current note
-        current_index = -1
-        for i, note in enumerate(notes):
-            if note.get('id') == note_id:
-                current_index = i
-                break
-        
-        if current_index != -1:
-            if direction == 'up' and current_index > 0:
-                # Swap with note above
-                notes[current_index], notes[current_index - 1] = notes[current_index - 1], notes[current_index]
-            elif direction == 'down' and current_index < len(notes) - 1:
-                # Swap with note below
-                notes[current_index], notes[current_index + 1] = notes[current_index + 1], notes[current_index]
+        if note:
+            current_priority = note['priority']
             
-            # Update priorities based on position
-            for i, note in enumerate(notes):
-                note['priority'] = i + 1
+            if direction == 'up':
+                # Get note above
+                above_note = db_query(
+                    "SELECT id, priority FROM notes WHERE priority < ? ORDER BY priority DESC LIMIT 1",
+                    (current_priority,), fetch_one=True
+                )
+                
+                if above_note:
+                    # Swap priorities
+                    db_query("UPDATE notes SET priority = ? WHERE id = ?", 
+                            (above_note['priority'], note_id))
+                    db_query("UPDATE notes SET priority = ? WHERE id = ?", 
+                            (current_priority, above_note['id']))
             
-            save_notes(notes)
+            elif direction == 'down':
+                # Get note below
+                below_note = db_query(
+                    "SELECT id, priority FROM notes WHERE priority > ? ORDER BY priority ASC LIMIT 1",
+                    (current_priority,), fetch_one=True
+                )
+                
+                if below_note:
+                    # Swap priorities
+                    db_query("UPDATE notes SET priority = ? WHERE id = ?", 
+                            (below_note['priority'], note_id))
+                    db_query("UPDATE notes SET priority = ? WHERE id = ?", 
+                            (current_priority, below_note['id']))
     
     return redirect(url_for('index', view='notes'))
 
@@ -2986,7 +2935,7 @@ def update_task():
     if not session.get('logged_in'):
         return redirect(url_for('index'))
     
-    task_id = int(request.form.get('task_id'))
+    task_id = request.form.get('task_id')
     title = request.form.get('title', '').strip()
     description = request.form.get('description', '').strip()
     priority = int(request.form.get('priority', 15))
@@ -3008,24 +2957,15 @@ def update_task():
         start_datetime = start_dt.strftime('%Y-%m-%d %H:%M:%S')
         end_datetime = end_dt.strftime('%Y-%m-%d %H:%M:%S')
         
-        # Get all tasks
-        tasks = get_all_tasks()
-        
-        for task in tasks:
-            if task.get('id') == task_id:
-                task['title'] = title
-                task['description'] = description
-                task['start_time'] = start_datetime
-                task['end_time'] = end_datetime
-                task['notify_enabled'] = notify_enabled
-                task['priority'] = priority
-                task['repeat'] = repeat
-                task['repeat_day'] = repeat_day
-                task['repeat_end_date'] = repeat_end_date
-                task['next_occurrence'] = start_datetime if repeat != 'none' else None
-                break
-        
-        save_tasks(tasks)
+        db_query(
+            """UPDATE tasks SET title = ?, description = ?, start_time = ?, end_time = ?, 
+               notify_enabled = ?, priority = ?, repeat = ?, repeat_day = ?, repeat_end_date = ?,
+               next_occurrence = ? 
+               WHERE id = ?""",
+            (title, description, start_datetime, end_datetime, notify_enabled, 
+             priority, repeat, repeat_day, repeat_end_date,
+             start_datetime if repeat != 'none' else None, task_id)
+        )
     
     return redirect(url_for('index', view='tasks'))
 
@@ -3035,27 +2975,17 @@ def update_subtask():
     if not session.get('logged_in'):
         return redirect(url_for('index'))
     
-    task_id = int(request.form.get('task_id'))
-    subtask_id = int(request.form.get('subtask_id'))
+    task_id = request.form.get('task_id')
+    subtask_id = request.form.get('subtask_id')
     title = request.form.get('title', '').strip()
     description = request.form.get('description', '').strip()
     priority = int(request.form.get('priority', 15))
     
     if subtask_id and title:
-        # Get all tasks
-        tasks = get_all_tasks()
-        
-        for task in tasks:
-            if task.get('id') == task_id:
-                for subtask in task.get('subtasks', []):
-                    if subtask.get('id') == subtask_id:
-                        subtask['title'] = title
-                        subtask['description'] = description
-                        subtask['priority'] = priority
-                        break
-                break
-        
-        save_tasks(tasks)
+        db_query(
+            "UPDATE subtasks SET title = ?, description = ?, priority = ? WHERE id = ?",
+            (title, description, priority, subtask_id)
+        )
     
     return redirect(url_for('index', view='tasks'))
 
@@ -3069,10 +2999,11 @@ def toggle_setting():
     enabled = request.form.get('enabled')
     
     if key and enabled is not None:
-        settings = get_settings()
         value = '1' if enabled == 'on' else '0'
-        settings[key] = value
-        save_settings(settings)
+        db_query(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, value)
+        )
         
         # Send confirmation
         if key == 'half_hourly_report':
@@ -3097,10 +3028,9 @@ def get_task_api(task_id):
     if not session.get('logged_in'):
         return jsonify({'error': 'Unauthorized'}), 401
     
-    tasks = get_all_tasks()
-    for task in tasks:
-        if task.get('id') == task_id:
-            return jsonify(task)
+    task = db_query("SELECT * FROM tasks WHERE id = ?", (task_id,), fetch_one=True)
+    if task:
+        return jsonify(row_to_dict(task))
     return jsonify({'error': 'Task not found'}), 404
 
 @app.route('/get_note/<int:note_id>')
@@ -3109,10 +3039,9 @@ def get_note_api(note_id):
     if not session.get('logged_in'):
         return jsonify({'error': 'Unauthorized'}), 401
     
-    notes = get_all_notes()
-    for note in notes:
-        if note.get('id') == note_id:
-            return jsonify(note)
+    note = db_query("SELECT * FROM notes WHERE id = ?", (note_id,), fetch_one=True)
+    if note:
+        return jsonify(row_to_dict(note))
     return jsonify({'error': 'Note not found'}), 404
 
 @app.route('/get_subtask/<int:task_id>/<int:subtask_id>')
@@ -3121,14 +3050,12 @@ def get_subtask_api(task_id, subtask_id):
     if not session.get('logged_in'):
         return jsonify({'error': 'Unauthorized'}), 401
     
-    tasks = get_all_tasks()
-    for task in tasks:
-        if task.get('id') == task_id:
-            for subtask in task.get('subtasks', []):
-                if subtask.get('id') == subtask_id:
-                    return jsonify(subtask)
-            break
-    
+    subtask = db_query(
+        "SELECT * FROM subtasks WHERE id = ? AND task_id = ?",
+        (subtask_id, task_id), fetch_one=True
+    )
+    if subtask:
+        return jsonify(row_to_dict(subtask))
     return jsonify({'error': 'Subtask not found'}), 404
 
 # ============= START APPLICATION =============
@@ -3150,16 +3077,7 @@ if __name__ == '__main__':
     print(f"🤖 Telegram User ID: {USER_ID}")
     print(f"🔔 Notifications: 1 per minute for 10 minutes before task start")
     print(f"📊 30-Minute Reports: Enabled")
-    print(f"🌐 GitHub Storage: Using repository {GITHUB_REPO}")
     print("=" * 60)
-    
-    # Test GitHub connection
-    print("🔗 Testing GitHub connection...")
-    test_data = load_from_github("tasks")
-    if test_data is not None:
-        print("✅ GitHub connection successful!")
-    else:
-        print("⚠️ GitHub connection failed, using local backup only")
     
     # Start Telegram bot in background thread
     bot_thread = threading.Thread(target=start_bot_polling, daemon=True)

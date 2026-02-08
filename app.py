@@ -173,6 +173,37 @@ def row_to_dict(row):
         return None
     return dict(row)
 
+
+# ============= FAKE JSON DATA GENERATOR =============
+
+FAKE_JSON_FILE = "fake_users.json"
+
+def generate_fake_json():
+    names = [
+        "Jejeje","Dvvb","Dvb","Dhjj","Dggg","Dggh","Djkkvvv","Rvvc",
+        "Tgcvkj","Tjgg","Tvvj","Thhhjjjj","Tybh","Ybbb","Thhh",
+        "Tbbbb","Rhhrj","Ynnn","Ybbn"
+    ]
+
+    fake_data = []
+    now = datetime.now(IST)
+
+    for i, name in enumerate(names, start=1):
+        fake_data.append({
+            "id": i,
+            "name": name,
+            "username": f"{name.lower()}_{secrets.randbelow(9999)}",
+            "email": f"{name.lower()}@example.com",
+            "created_at": (now - timedelta(days=secrets.randbelow(30))).strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "active"
+        })
+
+    with open(FAKE_JSON_FILE, "w", encoding="utf-8") as f:
+        json.dump(fake_data, f, indent=4)
+
+    print(f"[+] Fake JSON data saved to {FAKE_JSON_FILE}")
+    
+
 # ============= TIME FUNCTIONS =============
 def get_ist_time():
     """Get current time in IST"""

@@ -1,0 +1,6 @@
+Flask==2.3.3
+telebot==0.0.5
+schedule==1.2.0
+gunicorn==20.1.0
+requests==2.31.0
+python-telegram-bot==20.3

@@ -187,6 +187,224 @@ def get_next_history_id():
         return 1
     return max(item.get('id', 0) for item in history) + 1
 
+# ============= TASK MANAGEMENT FUNCTIONS =============
+def create_new_task(title, description, priority, notify_enabled, repeat, repeat_day, 
+                   repeat_end_date, start_date, start_time, end_date, end_time):
+    """Create a new task with proper validation"""
+    if not title or not start_date or not start_time:
+        return None
+    
+    # Create datetime in IST
+    start_dt = parse_ist_time(start_time, start_date)
+    end_dt = parse_ist_time(end_time, end_date)
+    
+    # Validate dates
+    if end_dt <= start_dt:
+        # Auto-adjust end time to be 1 hour after start
+        end_dt = start_dt + timedelta(hours=1)
+    
+    start_datetime = start_dt.strftime('%Y-%m-%d %H:%M:%S')
+    end_datetime = end_dt.strftime('%Y-%m-%d %H:%M:%S')
+    
+    new_task = {
+        'id': get_next_task_id(),
+        'title': title,
+        'description': description,
+        'start_time': start_datetime,
+        'end_time': end_datetime,
+        'notify_enabled': notify_enabled,
+        'priority': priority,
+        'repeat': repeat,
+        'repeat_day': repeat_day,
+        'repeat_end_date': repeat_end_date,
+        'next_occurrence': start_datetime if repeat != 'none' else None,
+        'completed': 0,
+        'subtasks': [],
+        'last_notified_minute': -1,
+        'bucket': 'today',
+        'created_at': get_ist_time().strftime('%Y-%m-%d %H:%M:%S'),
+        'status': 'active'
+    }
+    
+    return new_task
+
+def update_task_details(task_id, title, description, priority, notify_enabled, repeat, 
+                       repeat_day, repeat_end_date, start_date, start_time, end_date, end_time):
+    """Update existing task details"""
+    tasks = load_tasks()
+    
+    for task in tasks:
+        if task.get('id') == task_id:
+            # Create datetime in IST
+            start_dt = parse_ist_time(start_time, start_date)
+            end_dt = parse_ist_time(end_time, end_date)
+            
+            # Validate dates
+            if end_dt <= start_dt:
+                end_dt = start_dt + timedelta(hours=1)
+            
+            start_datetime = start_dt.strftime('%Y-%m-%d %H:%M:%S')
+            end_datetime = end_dt.strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Update task fields
+            task.update({
+                'title': title,
+                'description': description,
+                'start_time': start_datetime,
+                'end_time': end_datetime,
+                'notify_enabled': notify_enabled,
+                'priority': priority,
+                'repeat': repeat,
+                'repeat_day': repeat_day,
+                'repeat_end_date': repeat_end_date,
+                'next_occurrence': start_datetime if repeat != 'none' else None,
+                'status': 'active' if not task.get('completed', 0) else 'completed'
+            })
+            
+            save_tasks(tasks)
+            return True
+    
+    return False
+
+def delete_task_by_id(task_id):
+    """Delete a task by ID"""
+    tasks = load_tasks()
+    original_count = len(tasks)
+    tasks = [task for task in tasks if task.get('id') != task_id]
+    
+    if len(tasks) < original_count:
+        save_tasks(tasks)
+        return True
+    return False
+
+def complete_task_by_id(task_id):
+    """Mark a task as completed and move to history"""
+    tasks = load_tasks()
+    
+    for task in tasks:
+        if task.get('id') == task_id and not task.get('completed', 0):
+            # Mark as completed
+            task['completed'] = 1
+            task['status'] = 'completed'
+            
+            # Get task details for history
+            start_dt = datetime.strptime(task.get('start_time', ''), '%Y-%m-%d %H:%M:%S')
+            start_dt = IST.localize(start_dt)
+            end_dt = datetime.strptime(task.get('end_time', ''), '%Y-%m-%d %H:%M:%S')
+            end_dt = IST.localize(end_dt)
+            time_range = f"{start_dt.strftime('%I:%M %p')} - {end_dt.strftime('%I:%M %p')}"
+            
+            # Load and update history
+            history = load_history()
+            
+            history_item = {
+                'id': get_next_history_id(),
+                'task_id': task_id,
+                'title': task.get('title', ''),
+                'description': task.get('description', ''),
+                'type': 'task',
+                'bucket': task.get('bucket', 'today'),
+                'repeat': task.get('repeat', 'none'),
+                'time_range': time_range,
+                'priority': task.get('priority', 15),
+                'completed_at': get_ist_time().strftime('%Y-%m-%d %H:%M:%S'),
+                'subtasks': [st for st in task.get('subtasks', []) if st.get('completed', 0)]
+            }
+            
+            history.append(history_item)
+            
+            save_tasks(tasks)
+            save_history(history)
+            
+            return task
+    
+    return None
+
+# ============= SUBTASK MANAGEMENT FUNCTIONS =============
+def add_subtask_to_task(task_id, title, description):
+    """Add a subtask to a specific task"""
+    tasks = load_tasks()
+    
+    for task in tasks:
+        if task.get('id') == task_id:
+            subtasks = task.get('subtasks', [])
+            
+            # Get next priority
+            priority = 1
+            if subtasks:
+                max_priority = max(st.get('priority', 0) for st in subtasks)
+                priority = max_priority + 1
+            
+            new_subtask = {
+                'id': len(subtasks) + 1,
+                'title': title,
+                'description': description,
+                'priority': priority,
+                'completed': 0,
+                'created_at': get_ist_time().strftime('%Y-%m-%d %H:%M:%S')
+            }
+            
+            subtasks.append(new_subtask)
+            task['subtasks'] = subtasks
+            save_tasks(tasks)
+            return new_subtask
+    
+    return None
+
+def update_subtask_details(task_id, subtask_id, title, description, priority):
+    """Update subtask details"""
+    tasks = load_tasks()
+    
+    for task in tasks:
+        if task.get('id') == task_id:
+            subtasks = task.get('subtasks', [])
+            for subtask in subtasks:
+                if subtask.get('id') == subtask_id:
+                    subtask.update({
+                        'title': title,
+                        'description': description,
+                        'priority': priority
+                    })
+                    save_tasks(tasks)
+                    return True
+            break
+    
+    return False
+
+def delete_subtask_by_id(task_id, subtask_id):
+    """Delete a subtask"""
+    tasks = load_tasks()
+    
+    for task in tasks:
+        if task.get('id') == task_id:
+            subtasks = task.get('subtasks', [])
+            original_count = len(subtasks)
+            task['subtasks'] = [st for st in subtasks if st.get('id') != subtask_id]
+            
+            if len(task['subtasks']) < original_count:
+                save_tasks(tasks)
+                return True
+            break
+    
+    return False
+
+def toggle_subtask_completion(task_id, subtask_id):
+    """Toggle subtask completion status"""
+    tasks = load_tasks()
+    
+    for task in tasks:
+        if task.get('id') == task_id:
+            subtasks = task.get('subtasks', [])
+            for subtask in subtasks:
+                if subtask.get('id') == subtask_id:
+                    current_status = subtask.get('completed', 0)
+                    subtask['completed'] = 0 if current_status else 1
+                    save_tasks(tasks)
+                    return subtask
+            break
+    
+    return None
+
 # ============= TELEGRAM FUNCTIONS =============
 def send_telegram_message(text, chat_id=USER_ID):
     """Send message to Telegram"""
@@ -428,7 +646,7 @@ def send_welcome(message):
         InlineKeyboardButton("📊 Summary", callback_data='summary'),
         InlineKeyboardButton("⏰ Current Time", callback_data='current_time'),
         InlineKeyboardButton("🔄 Test", callback_data='test_notification'),
-        InlineKeyboardButton("🌐 Open Web App", web_app=WebAppInfo(url=f"https://patient-maxie-sandip232-786edcb8.koyeb.app/")),
+        InlineKeyboardButton("🌐 Open Web App", web_app=WebAppInfo(url=f"https://handsome-rafaela-sandip232-7f9d347c.koyeb.app/")),
         InlineKeyboardButton("🔙 Back", callback_data='back_to_main')
     )
     
@@ -460,7 +678,7 @@ def send_welcome(message):
 🌐 <b>Web Interface:</b>
 ━━━━━━━━━━━━━━━━━━━━
 
-https://patient-maxie-sandip232-786edcb8.koyeb.app/
+https://handsome-rafaela-sandip232-7f9d347c.koyeb.app/
 """
     bot.send_message(message.chat.id, welcome, parse_mode='HTML', reply_markup=keyboard)
 
@@ -614,7 +832,7 @@ def send_today_tasks(message):
     
     for task in tasks:
         status = "✅" if task.get('completed', 0) else "⏳"
-        start_time = datetime.strptime(task.get('start_time', ''), '%Y-%m-%d %H:%M:%S')
+        start_time = datetime.strptime(task.get('start_time', ''), '%Y-%m-d %H:%M:%S')
         start_time = IST.localize(start_time)
         end_time = datetime.strptime(task.get('end_time', ''), '%Y-%m-%d %H:%M:%S')
         end_time = IST.localize(end_time)
@@ -2559,7 +2777,7 @@ def add_task():
     repeat_day = None
     if repeat == 'weekly':
         now = get_ist_time()
-        repeat_day = now.strftime('%A')  # Gets day name like "Monday"
+        repeat_day = now.strftime('%A')
     
     repeat_end_date = request.form.get('repeat_end_date')
     
@@ -2568,57 +2786,44 @@ def add_task():
     end_date = request.form.get('end_date')
     end_time = request.form.get('end_time')
     
-    if not title or not start_date or not start_time:
-        return redirect(url_for('index', view='tasks'))
+    # Create new task using the new function
+    new_task = create_new_task(
+        title=title,
+        description=description,
+        priority=priority,
+        notify_enabled=notify_enabled,
+        repeat=repeat,
+        repeat_day=repeat_day,
+        repeat_end_date=repeat_end_date,
+        start_date=start_date,
+        start_time=start_time,
+        end_date=end_date,
+        end_time=end_time
+    )
     
-    # Create datetime in IST
-    start_dt = parse_ist_time(start_time, start_date)
-    end_dt = parse_ist_time(end_time, end_date)
-    
-    start_datetime = start_dt.strftime('%Y-%m-%d %H:%M:%S')
-    end_datetime = end_dt.strftime('%Y-%m-%d %H:%M:%S')
-    
-    # Load existing tasks
-    tasks = load_tasks()
-    
-    # Create new task
-    new_task = {
-        'id': get_next_task_id(),
-        'title': title,
-        'description': description,
-        'start_time': start_datetime,
-        'end_time': end_datetime,
-        'notify_enabled': notify_enabled,
-        'priority': priority,
-        'repeat': repeat,
-        'repeat_day': repeat_day,
-        'repeat_end_date': repeat_end_date,
-        'next_occurrence': start_datetime if repeat != 'none' else None,
-        'completed': 0,
-        'subtasks': [],
-        'last_notified_minute': -1,
-        'bucket': 'today',
-        'created_at': get_ist_time().strftime('%Y-%m-%d %H:%M:%S')
-    }
-    
-    tasks.append(new_task)
-    save_tasks(tasks)
-    
-    # Send notification if enabled and starting soon
-    if notify_enabled:
-        now = get_ist_time()
-        minutes_until = int((start_dt - now).total_seconds() / 60)
+    if new_task:
+        # Load existing tasks and add new task
+        tasks = load_tasks()
+        tasks.append(new_task)
+        save_tasks(tasks)
         
-        if 1 <= minutes_until <= 10:
-            message = "━━━━━━━━━━━━━━━━━━━━\n"
-            message += "✅ <b>Task Added</b>\n"
-            message += "━━━━━━━━━━━━━━━━━━━━\n\n"
-            message += f"📝 <b>{title}</b>\n"
-            message += f"🕐 Starts in {minutes_until} minute"
-            if minutes_until > 1:
-                message += "s"
-            message += f"\n📅 {start_dt.strftime('%I:%M %p')} IST"
-            send_telegram_message(message)
+        # Send notification if enabled
+        if notify_enabled:
+            now = get_ist_time()
+            start_dt = datetime.strptime(new_task['start_time'], '%Y-%m-%d %H:%M:%S')
+            start_dt = IST.localize(start_dt)
+            minutes_until = int((start_dt - now).total_seconds() / 60)
+            
+            if 1 <= minutes_until <= 10:
+                message = "━━━━━━━━━━━━━━━━━━━━\n"
+                message += "✅ <b>Task Added</b>\n"
+                message += "━━━━━━━━━━━━━━━━━━━━\n\n"
+                message += f"📝 <b>{title}</b>\n"
+                message += f"🕐 Starts in {minutes_until} minute"
+                if minutes_until > 1:
+                    message += "s"
+                message += f"\n📅 {start_dt.strftime('%I:%M %p')} IST"
+                send_telegram_message(message)
     
     return redirect(url_for('index', view='tasks'))
 
@@ -2633,31 +2838,22 @@ def add_subtask():
     description = request.form.get('description', '').strip()
     
     if task_id and title:
-        tasks = load_tasks()
+        # Use the new subtask function
+        new_subtask = add_subtask_to_task(task_id, title, description)
         
-        for task in tasks:
-            if task.get('id') == task_id:
-                subtasks = task.get('subtasks', [])
-                
-                # Get current max priority for this task's subtasks
-                priority = 1
-                if subtasks:
-                    max_priority = max(st.get('priority', 0) for st in subtasks)
-                    priority = max_priority + 1
-                
-                new_subtask = {
-                    'id': len(subtasks) + 1,
-                    'title': title,
-                    'description': description,
-                    'priority': priority,
-                    'completed': 0,
-                    'created_at': get_ist_time().strftime('%Y-%m-%d %H:%M:%S')
-                }
-                
-                subtasks.append(new_subtask)
-                task['subtasks'] = subtasks
-                save_tasks(tasks)
-                break
+        if new_subtask:
+            # Send notification
+            tasks = load_tasks()
+            parent_task = next((t for t in tasks if t.get('id') == task_id), None)
+            if parent_task:
+                message = "━━━━━━━━━━━━━━━━━━━━\n"
+                message += f"📝 <b>Subtask Added</b>\n"
+                message += "━━━━━━━━━━━━━━━━━━━━\n\n"
+                message += f"✅ <b>{new_subtask['title']}</b>\n"
+                message += f"📋 Parent Task: {parent_task.get('title', '')}\n"
+                message += f"⏰ Time: {get_ist_time().strftime('%I:%M %p')} IST\n\n"
+                message += "<i>Break it down to conquer it! 💪</i>"
+                send_telegram_message(message)
     
     return redirect(url_for('index', view='tasks'))
 
@@ -2670,52 +2866,19 @@ def complete_task():
     task_id = int(request.form.get('task_id'))
     
     if task_id:
-        tasks = load_tasks()
+        # Use the new complete task function
+        completed_task = complete_task_by_id(task_id)
         
-        for task in tasks:
-            if task.get('id') == task_id and not task.get('completed', 0):
-                # Mark task as completed
-                task['completed'] = 1
-                save_tasks(tasks)
-                
-                # Get task time range for history
-                start_dt = datetime.strptime(task.get('start_time', ''), '%Y-%m-%d %H:%M:%S')
-                start_dt = IST.localize(start_dt)
-                end_dt = datetime.strptime(task.get('end_time', ''), '%Y-%m-%d %H:%M:%S')
-                end_dt = IST.localize(end_dt)
-                time_range = f"{start_dt.strftime('%I:%M %p')} - {end_dt.strftime('%I:%M %p')}"
-                
-                # Load history
-                history = load_history()
-                
-                # Add to history
-                new_history_item = {
-                    'id': get_next_history_id(),
-                    'task_id': task_id,
-                    'title': task.get('title', ''),
-                    'description': task.get('description', ''),
-                    'type': 'task',
-                    'bucket': task.get('bucket', 'today'),
-                    'repeat': task.get('repeat', 'none'),
-                    'time_range': time_range,
-                    'priority': task.get('priority', 15),
-                    'completed_at': get_ist_time().strftime('%Y-%m-%d %H:%M:%S'),
-                    'subtasks': [st for st in task.get('subtasks', []) if st.get('completed', 0)]
-                }
-                
-                history.append(new_history_item)
-                save_history(history)
-                
-                # Send notification
-                now = get_ist_time()
-                message = "━━━━━━━━━━━━━━━━━━━━\n"
-                message += f"🎉 <b>Task Completed!</b>\n"
-                message += "━━━━━━━━━━━━━━━━━━━━\n\n"
-                message += f"✅ <b>{task.get('title', '')}</b>\n"
-                message += f"⏰ {now.strftime('%I:%M %p')} IST\n\n"
-                message += "<i>Great job! Keep it up! 🚀</i>"
-                send_telegram_message(message)
-                break
+        if completed_task:
+            # Send notification
+            now = get_ist_time()
+            message = "━━━━━━━━━━━━━━━━━━━━\n"
+            message += f"🎉 <b>Task Completed!</b>\n"
+            message += "━━━━━━━━━━━━━━━━━━━━\n\n"
+            message += f"✅ <b>{completed_task.get('title', '')}</b>\n"
+            message += f"⏰ {now.strftime('%I:%M %p')} IST\n\n"
+            message += "<i>Great job! Keep it up! 🚀</i>"
+            send_telegram_message(message)
     
     return redirect(url_for('index', view='tasks'))
 
@@ -2729,30 +2892,22 @@ def complete_subtask():
     subtask_id = int(request.form.get('subtask_id'))
     
     if task_id and subtask_id:
-        tasks = load_tasks()
+        # Use the new subtask completion function
+        updated_subtask = toggle_subtask_completion(task_id, subtask_id)
         
-        for task in tasks:
-            if task.get('id') == task_id:
-                subtasks = task.get('subtasks', [])
-                for subtask in subtasks:
-                    if subtask.get('id') == subtask_id:
-                        # Toggle completion
-                        current_status = subtask.get('completed', 0)
-                        subtask['completed'] = 0 if current_status else 1
-                        save_tasks(tasks)
-                        
-                        # Send notification if completed
-                        if subtask['completed'] == 1:
-                            message = "━━━━━━━━━━━━━━━━━━━━\n"
-                            message += f"✅ <b>Subtask Completed</b>\n"
-                            message += "━━━━━━━━━━━━━━━━━━━━\n\n"
-                            message += f"📝 <b>{subtask.get('title', '')}</b>\n"
-                            message += f"📋 <i>Parent Task:</i> {task.get('title', '')}\n"
-                            message += f"⏰ Time: {get_ist_time().strftime('%I:%M %p')} IST\n\n"
-                            message += "<i>One step closer! 👏</i>"
-                            send_telegram_message(message)
-                        break
-                break
+        if updated_subtask:
+            tasks = load_tasks()
+            parent_task = next((t for t in tasks if t.get('id') == task_id), None)
+            
+            if parent_task and updated_subtask['completed'] == 1:
+                message = "━━━━━━━━━━━━━━━━━━━━\n"
+                message += f"✅ <b>Subtask Completed</b>\n"
+                message += "━━━━━━━━━━━━━━━━━━━━\n\n"
+                message += f"📝 <b>{updated_subtask.get('title', '')}</b>\n"
+                message += f"📋 <i>Parent Task:</i> {parent_task.get('title', '')}\n"
+                message += f"⏰ Time: {get_ist_time().strftime('%I:%M %p')} IST\n\n"
+                message += "<i>One step closer! 👏</i>"
+                send_telegram_message(message)
     
     return redirect(url_for('index', view='tasks'))
 
@@ -2765,9 +2920,8 @@ def delete_task():
     task_id = int(request.form.get('task_id'))
     
     if task_id:
-        tasks = load_tasks()
-        tasks = [task for task in tasks if task.get('id') != task_id]
-        save_tasks(tasks)
+        # Use the new delete function
+        delete_task_by_id(task_id)
     
     return redirect(url_for('index', view='tasks'))
 
@@ -2781,14 +2935,8 @@ def delete_subtask():
     subtask_id = int(request.form.get('subtask_id'))
     
     if task_id and subtask_id:
-        tasks = load_tasks()
-        
-        for task in tasks:
-            if task.get('id') == task_id:
-                subtasks = task.get('subtasks', [])
-                task['subtasks'] = [st for st in subtasks if st.get('id') != subtask_id]
-                save_tasks(tasks)
-                break
+        # Use the new delete subtask function
+        delete_subtask_by_id(task_id, subtask_id)
     
     return redirect(url_for('index', view='tasks'))
 
@@ -2951,29 +3099,21 @@ def update_task():
     end_time = request.form.get('end_time')
     
     if task_id and title and start_date and start_time:
-        # Create datetime in IST
-        start_dt = parse_ist_time(start_time, start_date)
-        end_dt = parse_ist_time(end_time, end_date)
-        
-        start_datetime = start_dt.strftime('%Y-%m-%d %H:%M:%S')
-        end_datetime = end_dt.strftime('%Y-%m-%d %H:%M:%S')
-        
-        tasks = load_tasks()
-        
-        for task in tasks:
-            if task.get('id') == task_id:
-                task['title'] = title
-                task['description'] = description
-                task['start_time'] = start_datetime
-                task['end_time'] = end_datetime
-                task['notify_enabled'] = notify_enabled
-                task['priority'] = priority
-                task['repeat'] = repeat
-                task['repeat_day'] = repeat_day
-                task['repeat_end_date'] = repeat_end_date
-                task['next_occurrence'] = start_datetime if repeat != 'none' else None
-                save_tasks(tasks)
-                break
+        # Use the new update task function
+        update_task_details(
+            task_id=task_id,
+            title=title,
+            description=description,
+            priority=priority,
+            notify_enabled=notify_enabled,
+            repeat=repeat,
+            repeat_day=repeat_day,
+            repeat_end_date=repeat_end_date,
+            start_date=start_date,
+            start_time=start_time,
+            end_date=end_date,
+            end_time=end_time
+        )
     
     return redirect(url_for('index', view='tasks'))
 
@@ -2990,19 +3130,14 @@ def update_subtask():
     priority = int(request.form.get('priority', 15))
     
     if subtask_id and title:
-        tasks = load_tasks()
-        
-        for task in tasks:
-            if task.get('id') == task_id:
-                subtasks = task.get('subtasks', [])
-                for subtask in subtasks:
-                    if subtask.get('id') == subtask_id:
-                        subtask['title'] = title
-                        subtask['description'] = description
-                        subtask['priority'] = priority
-                        save_tasks(tasks)
-                        break
-                break
+        # Use the new update subtask function
+        update_subtask_details(
+            task_id=task_id,
+            subtask_id=subtask_id,
+            title=title,
+            description=description,
+            priority=priority
+        )
     
     return redirect(url_for('index', view='tasks'))
 

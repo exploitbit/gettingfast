@@ -65,8 +65,17 @@
     },
     {
       "id": 8,
-      "text": "Njss",
-      "timestamp": "2026-02-09 00:26:47",
+      "text": "\"\nInstance is stopping.\"\nInstance is stopping.\"\nInstance is stopping.Sjjsje\"\nInstance is stopping.Sjjsje\"\nInstance is stopping.SjjsjeSjjsje\"\nInstance is stopping.Sjjsje\"\nInstance is stopping.\"\nInstance is stopping.",
+      "timestamp": "2026-02-09 00:26:44",
+      "date": "February 09, 2026",
+      "time": "12:26 AM",
+      "type": "task",
+      "source": "telegram"
+    },
+    {
+      "id": 9,
+      "text": "Syy",
+      "timestamp": "2026-02-09 00:26:49",
       "date": "February 09, 2026",
       "time": "12:26 AM",
       "type": "task",
@@ -75,5 +84,5 @@
   ],
   "messages": [],
   "notes": [],
-  "last_id": 8
+  "last_id": 9
 }

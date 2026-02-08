@@ -1,13 +1,12 @@
-
 """
-Simplified Task Tracker with Telegram Bot
+Simplified Task Tracker with Telegram Bot - IST Timezone
 """
 
 import os
-import json
 import sqlite3
 import threading
 from datetime import datetime, timedelta
+import pytz
 from flask import Flask, request, Response, render_template_string
 import telebot
 import time
@@ -15,14 +14,14 @@ import time
 # ============= CONFIGURATION =============
 BOT_TOKEN = "8388773187:AAFxz5U8GJ94Wf21VaGvFx9QQSZFU2Rd43I"
 USER_ID = "8469993808"
-ADMIN_CODE = "1234"  # Default access code
+ADMIN_CODE = "1234"
+
+# Timezone setup
+IST = pytz.timezone('Asia/Kolkata')
 
 # Initialize Flask and Telegram bot
 app = Flask(__name__)
 bot = telebot.TeleBot(BOT_TOKEN)
-
-# Store notification timers
-notification_timers = {}
 
 # ============= DATABASE SETUP =============
 def init_db():
@@ -40,7 +39,7 @@ def init_db():
             completed INTEGER DEFAULT 0,
             notify_enabled INTEGER DEFAULT 1,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            last_notified_minute INTEGER DEFAULT 0
+            last_notified_minute INTEGER DEFAULT -1
         )
     ''')
     
@@ -97,12 +96,32 @@ def db_query(query, params=(), fetch_one=False):
     conn.close()
     return result
 
+# ============= TIME FUNCTIONS =============
+def get_ist_time():
+    """Get current time in IST"""
+    return datetime.now(IST)
+
+def format_ist_time(dt, format_str='%Y-%m-%d %H:%M:%S'):
+    """Format datetime in IST"""
+    if isinstance(dt, str):
+        dt = datetime.strptime(dt, '%Y-%m-%d %H:%M:%S')
+        dt = IST.localize(dt)
+    return dt.strftime(format_str)
+
+def parse_ist_time(time_str, date_str=None):
+    """Parse time string to IST datetime"""
+    if date_str is None:
+        date_str = get_ist_time().strftime('%Y-%m-%d')
+    
+    naive_dt = datetime.strptime(f"{date_str} {time_str}", '%Y-%m-%d %H:%M')
+    return IST.localize(naive_dt)
+
 # ============= TELEGRAM FUNCTIONS =============
 def send_telegram_message(text):
     """Send message to Telegram"""
     try:
         bot.send_message(USER_ID, text, parse_mode='HTML')
-        print(f"📨 Message sent: {text[:50]}...")
+        print(f"📨 Telegram: {text[:100]}...")
         return True
     except Exception as e:
         print(f"❌ Telegram error: {e}")
@@ -112,15 +131,15 @@ def send_telegram_message(text):
 def check_and_send_notifications():
     """Check and send notifications for tasks starting in 10 minutes"""
     try:
-        now = datetime.now()
-        print(f"⏰ Checking notifications at {now.strftime('%H:%M:%S')}")
+        now = get_ist_time()
+        print(f"⏰ Notification check at {now.strftime('%H:%M:%S')} IST")
         
-        # Get all active tasks with notifications enabled
+        # Get active tasks with notifications enabled
         tasks = db_query('''
             SELECT * FROM tasks 
             WHERE completed = 0 
             AND notify_enabled = 1
-            AND datetime(start_time) > datetime('now')
+            AND datetime(start_time) > datetime('now', '-1 hour')
             ORDER BY start_time
         ''')
         
@@ -131,53 +150,54 @@ def check_and_send_notifications():
                 task_id = task['id']
                 task_title = task['title']
                 start_time = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
+                start_time = IST.localize(start_time)
                 
                 # Calculate minutes until task starts
                 minutes_until_start = int((start_time - now).total_seconds() / 60)
                 
-                print(f"   Task '{task_title}': {minutes_until_start} minutes until start")
+                print(f"   Task '{task_title}': Starts at {start_time.strftime('%H:%M')} IST, {minutes_until_start} minutes from now")
                 
                 # If task starts in 1-10 minutes, send notification
                 if 1 <= minutes_until_start <= 10:
-                    # Check if we've already sent a notification for this minute
-                    last_notified = task.get('last_notified_minute', 0)
+                    last_notified = task.get('last_notified_minute', -1)
                     
+                    # Only send if we haven't notified for this specific minute
                     if last_notified != minutes_until_start:
-                        # Send notification
                         message = f"⏰ <b>Task Reminder</b>\n"
                         message += f"📝 {task_title}\n"
                         message += f"🕐 Starts in {minutes_until_start} minute"
                         if minutes_until_start > 1:
                             message += "s"
-                        message += f"\n📅 {start_time.strftime('%I:%M %p')}"
+                        message += f"\n📅 {start_time.strftime('%I:%M %p')} IST"
                         
                         if send_telegram_message(message):
-                            # Update last notified minute
                             db_query('''
                                 UPDATE tasks 
                                 SET last_notified_minute = ? 
                                 WHERE id = ?
                             ''', (minutes_until_start, task_id))
-                            print(f"   ✅ Sent notification for {minutes_until_start} minutes before")
+                            print(f"   ✅ Sent notification: {minutes_until_start} minutes before")
                 
                 # Reset notification counter if task has passed
-                elif minutes_until_start < 0:
+                elif minutes_until_start <= 0 and task.get('last_notified_minute', -1) != 0:
                     db_query('''
                         UPDATE tasks 
                         SET last_notified_minute = 0 
                         WHERE id = ?
                     ''', (task_id,))
+                    print(f"   🔄 Reset notifications for task {task_id}")
                     
             except Exception as e:
-                print(f"   ❌ Error processing task {task.get('id')}: {e}")
+                print(f"   ❌ Error with task {task.get('id')}: {e}")
         
     except Exception as e:
-        print(f"❌ Notification check error: {e}")
+        print(f"❌ Notification system error: {e}")
 
 def send_daily_summary():
     """Send daily task summary"""
     try:
-        today = datetime.now().strftime('%Y-%m-%d')
+        now = get_ist_time()
+        today = now.strftime('%Y-%m-%d')
         
         # Get today's tasks
         tasks = db_query('''
@@ -187,49 +207,56 @@ def send_daily_summary():
         ''', (today,))
         
         if not tasks:
-            message = f"📅 <b>Daily Summary - {datetime.now().strftime('%B %d, %Y')}</b>\n"
-            message += "No tasks for today! 🎉"
+            message = f"📅 <b>Daily Summary - {now.strftime('%B %d, %Y')}</b>\n"
+            message += "No tasks for today! 🎉\n"
+            message += f"⏰ {now.strftime('%I:%M %p')} IST"
             send_telegram_message(message)
             return
         
         completed = sum(1 for t in tasks if t['completed'])
         total = len(tasks)
         
-        message = f"📅 <b>Daily Summary - {datetime.now().strftime('%B %d, %Y')}</b>\n"
-        message += f"📊 {completed}/{total} tasks completed\n\n"
+        message = f"📅 <b>Daily Summary - {now.strftime('%B %d, %Y')}</b>\n"
+        message += f"📊 {completed}/{total} tasks completed\n"
+        message += f"⏰ {now.strftime('%I:%M %p')} IST\n\n"
         
         for task in tasks:
             status = "✅" if task['completed'] else "❌"
             start_time = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
+            start_time = IST.localize(start_time)
             message += f"{status} {task['title']} ({start_time.strftime('%I:%M %p')})\n"
         
         send_telegram_message(message)
         
     except Exception as e:
-        print(f"❌ Summary error: {e}")
+        print(f"❌ Daily summary error: {e}")
 
 def scheduler_thread():
     """Run scheduler in background thread"""
-    print("🔄 Starting scheduler thread...")
+    print("🔄 Starting scheduler thread in IST...")
     
     while True:
         try:
-            # Check every minute
+            # Check notifications every minute
             check_and_send_notifications()
             
-            # Check if it's 8:00 AM for daily summary
-            now = datetime.now()
+            # Check for daily summary at 8:00 AM IST
+            now = get_ist_time()
+            
+            # Debug: Print current time
+            if now.minute % 15 == 0:  # Every 15 minutes
+                print(f"⏰ Current IST time: {now.strftime('%H:%M:%S')}")
+            
             if now.hour == 8 and now.minute == 0:
-                # Check if daily summary is enabled
                 setting = db_query("SELECT value FROM settings WHERE key = 'daily_summary'", fetch_one=True)
                 if setting and setting['value'] == '1':
+                    print("📅 Sending daily summary...")
                     send_daily_summary()
-                    # Wait 2 minutes to avoid sending multiple times
-                    time.sleep(120)
+                    time.sleep(120)  # Sleep 2 minutes to avoid duplicate
             
-            # Wait for next minute
-            seconds_until_next_minute = 60 - now.second
-            time.sleep(seconds_until_next_minute)
+            # Calculate seconds until next minute
+            seconds_to_wait = 60 - now.second
+            time.sleep(seconds_to_wait)
             
         except Exception as e:
             print(f"❌ Scheduler error: {e}")
@@ -247,19 +274,24 @@ def send_welcome(message):
         bot.reply_to(message, "❌ Unauthorized")
         return
     
-    welcome = """
+    now = get_ist_time()
+    
+    welcome = f"""
 🤖 <b>Task Tracker Bot</b>
+⏰ Time: {now.strftime('%I:%M %p')} IST
+📅 Date: {now.strftime('%B %d, %Y')}
 
 <b>Commands:</b>
 /today - View today's tasks
-/add - Add new task
+/add - Add new task (format: /add Title @ HH:MM-HH:MM)
 /summary - Get daily summary
 /test - Test notification
+/time - Check current IST time
 /help - Show this message
 
 <b>Notifications:</b>
 • 1 notification per minute for 10 minutes before task starts
-• Daily summary at 8 AM
+• All times in IST
 
 <b>Web Interface:</b>
 https://patient-maxie-sandip232-786edcb8.koyeb.app/
@@ -272,7 +304,8 @@ def send_today_tasks(message):
     if str(message.chat.id) != USER_ID:
         return
     
-    today = datetime.now().strftime('%Y-%m-%d')
+    now = get_ist_time()
+    today = now.strftime('%Y-%m-%d')
     tasks = db_query('''
         SELECT * FROM tasks 
         WHERE date(start_time) = ?
@@ -280,15 +313,19 @@ def send_today_tasks(message):
     ''', (today,))
     
     if not tasks:
-        bot.reply_to(message, "📅 No tasks for today!")
+        bot.reply_to(message, f"📅 No tasks for today ({now.strftime('%B %d')})")
         return
     
-    response = f"📅 <b>Today's Tasks ({datetime.now().strftime('%B %d')})</b>\n\n"
+    response = f"📅 <b>Today's Tasks ({now.strftime('%B %d')})</b>\n"
+    response += f"⏰ {now.strftime('%I:%M %p')} IST\n\n"
     
     for task in tasks:
         status = "✅" if task['completed'] else "❌"
         start_time = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
+        start_time = IST.localize(start_time)
         end_time = datetime.strptime(task['end_time'], '%Y-%m-%d %H:%M:%S')
+        end_time = IST.localize(end_time)
+        
         response += f"{status} <b>{task['title']}</b>\n"
         response += f"   ⏰ {start_time.strftime('%I:%M')} - {end_time.strftime('%I:%M %p')}\n\n"
     
@@ -314,10 +351,14 @@ def add_task_from_telegram(message):
             return
         
         start_str, end_str = time_part.split('-')
-        today = datetime.now().strftime('%Y-%m-%d')
+        today = get_ist_time().strftime('%Y-%m-%d')
         
-        start_time = f"{today} {start_str}:00"
-        end_time = f"{today} {end_str}:00"
+        # Convert to IST datetime
+        start_dt = parse_ist_time(start_str, today)
+        end_dt = parse_ist_time(end_str, today)
+        
+        start_time = start_dt.strftime('%Y-%m-%d %H:%M:%S')
+        end_time = end_dt.strftime('%Y-%m-%d %H:%M:%S')
         
         # Insert task
         task_id = db_query(
@@ -325,23 +366,26 @@ def add_task_from_telegram(message):
             (title, start_time, end_time)
         )
         
+        # Calculate minutes until start
+        now = get_ist_time()
+        minutes_until = int((start_dt - now).total_seconds() / 60)
+        
         # Send confirmation
         response = f"✅ <b>Task Added</b>\n"
         response += f"📝 {title}\n"
-        response += f"⏰ {start_str} - {end_str}\n"
-        response += f"📅 {datetime.now().strftime('%B %d')}"
+        response += f"⏰ {start_str} - {end_str} IST\n"
+        response += f"📅 {today}\n"
+        
+        if 1 <= minutes_until <= 10:
+            response += f"\n🔔 You'll get notifications starting in {minutes_until} minutes"
         
         bot.reply_to(message, response, parse_mode='HTML')
         
-        # Send immediate notification
-        start_dt = datetime.strptime(start_time, '%Y-%m-%d %H:%M:%S')
-        now = datetime.now()
-        minutes_until = int((start_dt - now).total_seconds() / 60)
-        
+        # Send immediate notification if starting soon
         if 1 <= minutes_until <= 10:
-            notif_msg = f"⏰ <b>Task Added (starts in {minutes_until} min)</b>\n"
+            notif_msg = f"⏰ <b>New Task (starts in {minutes_until} min)</b>\n"
             notif_msg += f"📝 {title}\n"
-            notif_msg += f"🕐 {start_str} - {end_str}"
+            notif_msg += f"🕐 {start_str} - {end_str} IST"
             send_telegram_message(notif_msg)
         
     except Exception as e:
@@ -362,14 +406,30 @@ def test_notification(message):
     if str(message.chat.id) != USER_ID:
         return
     
+    now = get_ist_time()
     test_msg = "🔔 <b>Test Notification</b>\n"
     test_msg += "✅ Bot is working!\n"
-    test_msg += f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+    test_msg += f"⏰ {now.strftime('%H:%M:%S')} IST\n"
+    test_msg += f"📅 {now.strftime('%B %d, %Y')}"
     
     if send_telegram_message(test_msg):
         bot.reply_to(message, "✅ Test notification sent!")
     else:
         bot.reply_to(message, "❌ Failed to send test")
+
+@bot.message_handler(commands=['time'])
+def send_time(message):
+    """Send current IST time"""
+    if str(message.chat.id) != USER_ID:
+        return
+    
+    now = get_ist_time()
+    time_msg = f"⏰ <b>Current Time</b>\n"
+    time_msg += f"IST: {now.strftime('%I:%M:%S %p')}\n"
+    time_msg += f"Date: {now.strftime('%B %d, %Y')}\n"
+    time_msg += f"Timezone: Asia/Kolkata"
+    
+    bot.reply_to(message, time_msg, parse_mode='HTML')
 
 # ============= FLASK WEB APP =============
 @app.route('/')
@@ -385,10 +445,9 @@ def index():
         <head>
             <title>Task Tracker - Login</title>
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
             <style>
                 body {
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    font-family: -apple-system, sans-serif;
                     margin: 0;
                     padding: 20px;
                     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -424,7 +483,6 @@ def index():
                     border: 2px solid #ddd;
                     border-radius: 8px;
                     font-size: 16px;
-                    transition: border 0.3s;
                 }
                 input:focus {
                     outline: none;
@@ -441,9 +499,6 @@ def index():
                     font-size: 16px;
                     font-weight: 600;
                     margin-top: 10px;
-                }
-                button:active {
-                    transform: scale(0.98);
                 }
                 .error {
                     color: #ff4757;
@@ -464,7 +519,7 @@ def index():
                 <div class="logo">📱</div>
                 <h1>Task Tracker</h1>
                 <form method="POST" action="/login">
-                    <input type="password" name="code" placeholder="Enter Access Code" required autocomplete="off">
+                    <input type="password" name="code" placeholder="Enter Access Code" required>
                     <button type="submit">Login</button>
                 </form>
                 {% if error %}
@@ -481,8 +536,11 @@ def index():
     # Get current view
     view = request.args.get('view', 'tasks')
     
+    # Get current IST time
+    now = get_ist_time()
+    today = now.strftime('%Y-%m-%d')
+    
     # Get tasks for today
-    today = datetime.now().strftime('%Y-%m-%d')
     tasks = db_query('''
         SELECT * FROM tasks 
         WHERE date(start_time) = ?
@@ -508,12 +566,35 @@ def index():
     completed_today = sum(1 for t in tasks if t['completed'])
     pending_today = len(tasks) - completed_today
     
+    # Process tasks for display
+    processed_tasks = []
+    for task in tasks:
+        start_dt = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S')
+        start_dt = IST.localize(start_dt)
+        end_dt = datetime.strptime(task['end_time'], '%Y-%m-%d %H:%M:%S')
+        end_dt = IST.localize(end_dt)
+        
+        minutes_until = int((start_dt - now).total_seconds() / 60) if not task['completed'] else None
+        
+        processed_tasks.append({
+            'id': task['id'],
+            'title': task['title'],
+            'start_time': task['start_time'],
+            'end_time': task['end_time'],
+            'start_display': start_dt.strftime('%I:%M %p'),
+            'end_display': end_dt.strftime('%I:%M %p'),
+            'completed': task['completed'],
+            'notify_enabled': task['notify_enabled'],
+            'minutes_until': minutes_until,
+            'is_upcoming': minutes_until is not None and 1 <= minutes_until <= 10
+        })
+    
     return render_template_string('''
     <!DOCTYPE html>
     <html>
     <head>
         <title>Task Tracker</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <style>
             :root {
@@ -522,23 +603,18 @@ def index():
                 --success: #4cc9f0;
                 --danger: #f72585;
                 --warning: #f8961e;
-                --light: #f8f9fa;
-                --dark: #212529;
-                --gray: #6c757d;
             }
             
             * {
                 margin: 0;
                 padding: 0;
                 box-sizing: border-box;
-                -webkit-tap-highlight-color: transparent;
             }
             
             body {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                font-family: -apple-system, sans-serif;
                 background: #f5f5f7;
                 color: #333;
-                line-height: 1.6;
                 padding-bottom: 80px;
             }
             
@@ -550,7 +626,6 @@ def index():
                 position: sticky;
                 top: 0;
                 z-index: 100;
-                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
             }
             
             .header-top {
@@ -567,7 +642,9 @@ def index():
             
             .time-display {
                 font-size: 14px;
-                opacity: 0.9;
+                background: rgba(255,255,255,0.2);
+                padding: 4px 8px;
+                border-radius: 12px;
             }
             
             /* Tabs */
@@ -584,9 +661,7 @@ def index():
                 padding: 8px;
                 border-radius: 8px;
                 font-size: 14px;
-                font-weight: 500;
                 cursor: pointer;
-                transition: all 0.3s;
             }
             
             .tab.active {
@@ -601,16 +676,10 @@ def index():
             
             .section {
                 display: none;
-                animation: fadeIn 0.3s;
             }
             
             .section.active {
                 display: block;
-            }
-            
-            @keyframes fadeIn {
-                from { opacity: 0; transform: translateY(10px); }
-                to { opacity: 1; transform: translateY(0); }
             }
             
             /* Stats */
@@ -633,16 +702,15 @@ def index():
                 font-size: 24px;
                 font-weight: bold;
                 color: var(--primary);
-                margin-bottom: 5px;
             }
             
             .stat-label {
                 font-size: 12px;
-                color: var(--gray);
+                color: #666;
             }
             
-            /* Add Task Form */
-            .add-form {
+            /* Forms */
+            .form-card {
                 background: white;
                 border-radius: 12px;
                 padding: 20px;
@@ -654,10 +722,7 @@ def index():
                 font-size: 16px;
                 font-weight: 600;
                 margin-bottom: 15px;
-                color: var(--dark);
-                display: flex;
-                align-items: center;
-                gap: 10px;
+                color: #333;
             }
             
             .form-group {
@@ -668,7 +733,6 @@ def index():
                 display: block;
                 margin-bottom: 5px;
                 font-size: 14px;
-                color: var(--dark);
                 font-weight: 500;
             }
             
@@ -678,30 +742,12 @@ def index():
                 border: 2px solid #e9ecef;
                 border-radius: 8px;
                 font-size: 16px;
-                transition: border 0.3s;
-            }
-            
-            .form-input:focus {
-                outline: none;
-                border-color: var(--primary);
             }
             
             .time-row {
                 display: grid;
                 grid-template-columns: 1fr 1fr;
                 gap: 10px;
-            }
-            
-            .checkbox {
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                margin: 15px 0;
-            }
-            
-            .checkbox input {
-                width: 20px;
-                height: 20px;
             }
             
             /* Buttons */
@@ -713,7 +759,6 @@ def index():
                 font-weight: 600;
                 cursor: pointer;
                 width: 100%;
-                transition: all 0.3s;
             }
             
             .btn-primary {
@@ -721,25 +766,7 @@ def index():
                 color: white;
             }
             
-            .btn-primary:active {
-                transform: scale(0.98);
-            }
-            
-            .btn-danger {
-                background: var(--danger);
-                color: white;
-            }
-            
-            .btn-success {
-                background: var(--success);
-                color: white;
-            }
-            
-            /* Task List */
-            .tasks-list {
-                margin-top: 20px;
-            }
-            
+            /* Task Cards */
             .task-card {
                 background: white;
                 border-radius: 12px;
@@ -754,6 +781,16 @@ def index():
                 opacity: 0.8;
             }
             
+            .task-card.upcoming {
+                border-left-color: var(--warning);
+                animation: pulse 2s infinite;
+            }
+            
+            @keyframes pulse {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0.9; }
+            }
+            
             .task-header {
                 display: flex;
                 justify-content: space-between;
@@ -764,7 +801,6 @@ def index():
             .task-title {
                 font-size: 16px;
                 font-weight: 600;
-                color: var(--dark);
             }
             
             .task-status {
@@ -788,9 +824,15 @@ def index():
                 display: flex;
                 align-items: center;
                 gap: 8px;
-                color: var(--gray);
+                color: #666;
                 font-size: 14px;
                 margin: 8px 0;
+            }
+            
+            .task-notice {
+                font-size: 12px;
+                color: var(--warning);
+                margin: 5px 0;
             }
             
             .task-actions {
@@ -805,7 +847,6 @@ def index():
                 border: none;
                 border-radius: 8px;
                 font-size: 14px;
-                font-weight: 500;
                 cursor: pointer;
                 display: flex;
                 align-items: center;
@@ -813,139 +854,23 @@ def index():
                 gap: 8px;
             }
             
-            /* History */
-            .history-item {
-                background: white;
-                border-radius: 12px;
-                padding: 15px;
-                margin-bottom: 10px;
-                border-left: 4px solid var(--success);
+            .btn-success {
+                background: var(--success);
+                color: white;
             }
             
-            .history-title {
-                font-weight: 600;
-                margin-bottom: 5px;
-            }
-            
-            .history-time {
-                font-size: 12px;
-                color: var(--gray);
-            }
-            
-            /* Settings */
-            .settings-card {
-                background: white;
-                border-radius: 12px;
-                padding: 20px;
-                margin-bottom: 15px;
-            }
-            
-            .setting-item {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                padding: 15px 0;
-                border-bottom: 1px solid #eee;
-            }
-            
-            .setting-item:last-child {
-                border-bottom: none;
-            }
-            
-            .setting-info h4 {
-                font-size: 16px;
-                margin-bottom: 5px;
-            }
-            
-            .setting-info p {
-                font-size: 12px;
-                color: var(--gray);
-            }
-            
-            .toggle {
-                position: relative;
-                display: inline-block;
-                width: 50px;
-                height: 24px;
-            }
-            
-            .toggle input {
-                opacity: 0;
-                width: 0;
-                height: 0;
-            }
-            
-            .slider {
-                position: absolute;
-                cursor: pointer;
-                top: 0;
-                left: 0;
-                right: 0;
-                bottom: 0;
-                background-color: #ccc;
-                transition: .4s;
-                border-radius: 24px;
-            }
-            
-            .slider:before {
-                position: absolute;
-                content: "";
-                height: 16px;
-                width: 16px;
-                left: 4px;
-                bottom: 4px;
-                background-color: white;
-                transition: .4s;
-                border-radius: 50%;
-            }
-            
-            input:checked + .slider {
-                background-color: var(--success);
-            }
-            
-            input:checked + .slider:before {
-                transform: translateX(26px);
-            }
-            
-            /* Empty State */
-            .empty-state {
-                text-align: center;
-                padding: 40px 20px;
-                color: var(--gray);
-            }
-            
-            .empty-state i {
-                font-size: 48px;
-                margin-bottom: 15px;
-                opacity: 0.5;
-            }
-            
-            /* Logout */
-            .logout-btn {
+            .btn-danger {
                 background: var(--danger);
                 color: white;
-                padding: 14px;
-                border-radius: 8px;
-                text-align: center;
-                text-decoration: none;
-                display: block;
-                margin-top: 20px;
-                font-weight: 600;
             }
             
             /* Notification Banner */
-            .notification {
+            .notification-banner {
                 background: linear-gradient(135deg, var(--warning) 0%, #ff6b6b 100%);
                 color: white;
                 padding: 12px 15px;
                 border-radius: 12px;
                 margin-bottom: 20px;
-                animation: pulse 2s infinite;
-            }
-            
-            @keyframes pulse {
-                0%, 100% { opacity: 1; }
-                50% { opacity: 0.8; }
             }
             
             /* FAB */
@@ -965,11 +890,6 @@ def index():
                 cursor: pointer;
                 box-shadow: 0 4px 15px rgba(67, 97, 238, 0.3);
                 z-index: 100;
-                transition: all 0.3s;
-            }
-            
-            .fab:active {
-                transform: scale(0.9);
             }
         </style>
     </head>
@@ -979,7 +899,7 @@ def index():
             <div class="header-top">
                 <h1><i class="fas fa-tasks"></i> Task Tracker</h1>
                 <div class="time-display">
-                    {{ datetime.now().strftime('%I:%M %p') }}
+                    {{ now.strftime('%I:%M %p') }} IST
                 </div>
             </div>
             
@@ -1001,7 +921,7 @@ def index():
             <!-- Tasks View -->
             <div id="tasksView" class="section {{ 'active' if view == 'tasks' }}">
                 <!-- Notification Banner -->
-                <div class="notification">
+                <div class="notification-banner">
                     <div style="font-weight: 600; margin-bottom: 5px;">
                         <i class="fas fa-bell"></i> Notifications Active
                     </div>
@@ -1027,32 +947,32 @@ def index():
                 </div>
                 
                 <!-- Add Task Form -->
-                <div class="add-form">
+                <div class="form-card">
                     <div class="form-title">
-                        <i class="fas fa-plus-circle"></i> Add New Task
+                        <i class="fas fa-plus-circle"></i> Add New Task (IST)
                     </div>
                     <form method="POST" action="/add_task" id="taskForm">
                         <div class="form-group">
                             <label class="form-label">Task Title</label>
-                            <input type="text" class="form-input" name="title" placeholder="What needs to be done?" required autocomplete="off">
+                            <input type="text" class="form-input" name="title" placeholder="What needs to be done?" required>
                         </div>
                         
                         <div class="form-group">
-                            <label class="form-label">Time</label>
+                            <label class="form-label">Time (IST)</label>
                             <div class="time-row">
                                 <div>
                                     <input type="time" class="form-input" name="start_time" id="startTime" required>
-                                    <div style="font-size: 11px; color: var(--gray); text-align: center; margin-top: 3px;">Start</div>
+                                    <div style="font-size: 11px; color: #666; text-align: center; margin-top: 3px;">Start</div>
                                 </div>
                                 <div>
                                     <input type="time" class="form-input" name="end_time" id="endTime" required>
-                                    <div style="font-size: 11px; color: var(--gray); text-align: center; margin-top: 3px;">End</div>
+                                    <div style="font-size: 11px; color: #666; text-align: center; margin-top: 3px;">End</div>
                                 </div>
                             </div>
                         </div>
                         
-                        <div class="checkbox">
-                            <input type="checkbox" name="notify_enabled" id="notifyEnabled" checked>
+                        <div style="display: flex; align-items: center; gap: 10px; margin: 15px 0;">
+                            <input type="checkbox" name="notify_enabled" id="notifyEnabled" checked style="width: 20px; height: 20px;">
                             <label for="notifyEnabled" style="font-size: 14px;">Enable notifications</label>
                         </div>
                         
@@ -1063,53 +983,46 @@ def index():
                 </div>
                 
                 <!-- Tasks List -->
-                <div class="tasks-list">
-                    <div style="font-size: 16px; font-weight: 600; margin-bottom: 15px; color: var(--dark);">
+                <div>
+                    <div style="font-size: 16px; font-weight: 600; margin-bottom: 15px; color: #333;">
                         <i class="fas fa-calendar-day"></i> Today's Tasks
-                        <span style="font-size: 12px; color: var(--gray); font-weight: normal; margin-left: 8px;">
-                            {{ datetime.now().strftime('%B %d') }}
+                        <span style="font-size: 12px; color: #666; font-weight: normal; margin-left: 8px;">
+                            {{ now.strftime('%B %d') }} IST
                         </span>
                     </div>
                     
-                    {% if not tasks %}
-                    <div class="empty-state">
-                        <i class="fas fa-clipboard-list"></i>
+                    {% if not processed_tasks %}
+                    <div style="text-align: center; padding: 40px 20px; color: #666;">
+                        <i class="fas fa-clipboard-list" style="font-size: 48px; opacity: 0.5;"></i>
                         <p>No tasks for today</p>
-                        <p style="font-size: 12px; margin-top: 5px;">Add your first task above!</p>
                     </div>
                     {% endif %}
                     
-                    {% for task in tasks %}
-                    <div class="task-card {{ 'completed' if task['completed'] }}">
+                    {% for task in processed_tasks %}
+                    <div class="task-card {{ 'completed' if task.completed }} {{ 'upcoming' if task.is_upcoming and not task.completed }}">
                         <div class="task-header">
-                            <div class="task-title">{{ task['title'] }}</div>
-                            <div class="task-status {{ 'status-completed' if task['completed'] else 'status-pending' }}">
-                                {{ '✅ Completed' if task['completed'] else '⏳ Pending' }}
+                            <div class="task-title">{{ task.title }}</div>
+                            <div class="task-status {{ 'status-completed' if task.completed else 'status-pending' }}">
+                                {{ '✅ Completed' if task.completed else '⏳ Pending' }}
                             </div>
                         </div>
                         
                         <div class="task-time">
                             <i class="far fa-clock"></i>
-                            {{ datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S').strftime('%I:%M %p') }}
-                            -
-                            {{ datetime.strptime(task['end_time'], '%Y-%m-%d %H:%M:%S').strftime('%I:%M %p') }}
+                            {{ task.start_display }} - {{ task.end_display }} IST
                         </div>
                         
-                        {% if not task['completed'] %}
-                        {% set start_dt = datetime.strptime(task['start_time'], '%Y-%m-%d %H:%M:%S') %}
-                        {% set minutes_left = (start_dt - datetime.now()).total_seconds() / 60 %}
-                        {% if 0 < minutes_left <= 60 %}
-                        <div style="font-size: 12px; color: var(--warning); margin: 5px 0;">
-                            <i class="fas fa-hourglass-half"></i>
-                            Starts in {{ minutes_left|int }} minute{{ 's' if minutes_left|int > 1 else '' }}
+                        {% if task.is_upcoming and not task.completed %}
+                        <div class="task-notice">
+                            <i class="fas fa-bell"></i>
+                            Notifications active: Starts in {{ task.minutes_until }} minute{{ 's' if task.minutes_until > 1 else '' }}
                         </div>
-                        {% endif %}
                         {% endif %}
                         
                         <div class="task-actions">
-                            {% if not task['completed'] %}
+                            {% if not task.completed %}
                             <form method="POST" action="/complete_task" style="display: contents;">
-                                <input type="hidden" name="task_id" value="{{ task['id'] }}">
+                                <input type="hidden" name="task_id" value="{{ task.id }}">
                                 <button type="submit" class="action-btn btn-success">
                                     <i class="fas fa-check"></i> Complete
                                 </button>
@@ -1117,7 +1030,7 @@ def index():
                             {% endif %}
                             
                             <form method="POST" action="/delete_task" style="display: contents;">
-                                <input type="hidden" name="task_id" value="{{ task['id'] }}">
+                                <input type="hidden" name="task_id" value="{{ task.id }}">
                                 <button type="submit" class="action-btn btn-danger" onclick="return confirm('Delete this task?')">
                                     <i class="fas fa-trash"></i> Delete
                                 </button>
@@ -1130,23 +1043,25 @@ def index():
             
             <!-- History View -->
             <div id="historyView" class="section {{ 'active' if view == 'history' }}">
-                <div style="font-size: 16px; font-weight: 600; margin-bottom: 15px; color: var(--dark);">
+                <div style="font-size: 16px; font-weight: 600; margin-bottom: 15px; color: #333;">
                     <i class="fas fa-history"></i> Task History
                 </div>
                 
                 {% if not history %}
-                <div class="empty-state">
-                    <i class="fas fa-history"></i>
+                <div style="text-align: center; padding: 40px 20px; color: #666;">
+                    <i class="fas fa-history" style="font-size: 48px; opacity: 0.5;"></i>
                     <p>No completed tasks yet</p>
                 </div>
                 {% endif %}
                 
                 {% for item in history %}
-                <div class="history-item">
-                    <div class="history-title">{{ item['task_title'] or item['title'] }}</div>
-                    <div class="history-time">
+                <div style="background: white; border-radius: 12px; padding: 15px; margin-bottom: 10px; border-left: 4px solid var(--success);">
+                    <div style="font-weight: 600; margin-bottom: 5px;">
+                        {{ item.task_title or item.title }}
+                    </div>
+                    <div style="font-size: 12px; color: #666;">
                         <i class="far fa-calendar-check"></i>
-                        {{ datetime.strptime(item['completed_at'], '%Y-%m-%d %H:%M:%S').strftime('%B %d, %I:%M %p') }}
+                        {{ datetime.strptime(item.completed_at, '%Y-%m-%d %H:%M:%S').strftime('%B %d, %I:%M %p') }} IST
                     </div>
                 </div>
                 {% endfor %}
@@ -1154,46 +1069,51 @@ def index():
             
             <!-- Settings View -->
             <div id="settingsView" class="section {{ 'active' if view == 'settings' }}">
-                <div class="settings-card">
-                    <div style="font-size: 16px; font-weight: 600; margin-bottom: 20px; color: var(--dark);">
+                <div class="form-card">
+                    <div class="form-title">
                         <i class="fas fa-bell"></i> Notifications
                     </div>
                     
-                    <div class="setting-item">
-                        <div class="setting-info">
-                            <h4>Daily Summary</h4>
-                            <p>Send daily task summary at 8:00 AM</p>
-                        </div>
-                        <form method="POST" action="/toggle_setting" style="display: inline;">
-                            <input type="hidden" name="key" value="daily_summary">
-                            <label class="toggle">
-                                <input type="checkbox" name="enabled" {{ 'checked' if settings.get('daily_summary') == '1' }} onchange="this.form.submit()">
-                                <span class="slider"></span>
-                            </label>
-                        </form>
-                    </div>
-                    
-                    <div style="margin-top: 15px; padding: 12px; background: #f8f9fa; border-radius: 8px; font-size: 13px;">
+                    <div style="margin-bottom: 20px; padding: 12px; background: #f8f9fa; border-radius: 8px;">
                         <div style="font-weight: 600; margin-bottom: 5px; color: var(--primary);">
                             <i class="fas fa-info-circle"></i> Notification Schedule
                         </div>
-                        <div>You'll receive 1 notification per minute for 10 minutes before each task starts</div>
+                        <div style="font-size: 14px;">
+                            1 notification per minute for 10 minutes before each task starts
+                        </div>
                     </div>
+                    
+                    <form method="POST" action="/toggle_setting">
+                        <input type="hidden" name="key" value="daily_summary">
+                        <div style="display: flex; justify-content: space-between; align-items: center; padding: 15px 0; border-bottom: 1px solid #eee;">
+                            <div>
+                                <div style="font-weight: 600; font-size: 15px;">Daily Summary</div>
+                                <div style="font-size: 12px; color: #666;">Send daily summary at 8:00 AM IST</div>
+                            </div>
+                            <div style="position: relative; width: 50px; height: 24px;">
+                                <input type="checkbox" name="enabled" {{ 'checked' if settings.get('daily_summary') == '1' }} 
+                                       onchange="this.form.submit()" 
+                                       style="position: absolute; opacity: 0; width: 0; height: 0;">
+                                <span style="position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: {{ '#4cc9f0' if settings.get('daily_summary') == '1' else '#ccc' }}; border-radius: 24px; transition: .4s;"></span>
+                                <span style="position: absolute; content: ''; height: 16px; width: 16px; left: {{ '26px' if settings.get('daily_summary') == '1' else '4px' }}; bottom: 4px; background-color: white; border-radius: 50%; transition: .4s;"></span>
+                            </div>
+                        </div>
+                    </form>
                 </div>
                 
-                <div class="settings-card">
-                    <div style="font-size: 16px; font-weight: 600; margin-bottom: 20px; color: var(--dark);">
+                <div class="form-card">
+                    <div class="form-title">
                         <i class="fas fa-key"></i> Security
                     </div>
                     
                     <form method="POST" action="/change_code">
                         <div class="form-group">
                             <label class="form-label">New Access Code</label>
-                            <input type="password" class="form-input" name="new_code" placeholder="Enter new code" required autocomplete="new-password">
+                            <input type="password" class="form-input" name="new_code" placeholder="Enter new code" required>
                         </div>
                         <div class="form-group">
                             <label class="form-label">Confirm Code</label>
-                            <input type="password" class="form-input" name="confirm_code" placeholder="Confirm new code" required autocomplete="new-password">
+                            <input type="password" class="form-input" name="confirm_code" placeholder="Confirm new code" required>
                         </div>
                         <button type="submit" class="btn btn-primary">
                             <i class="fas fa-save"></i> Change Access Code
@@ -1201,8 +1121,8 @@ def index():
                     </form>
                 </div>
                 
-                <div class="settings-card">
-                    <div style="font-size: 16px; font-weight: 600; margin-bottom: 15px; color: var(--dark);">
+                <div class="form-card">
+                    <div class="form-title">
                         <i class="fab fa-telegram"></i> Telegram Bot
                     </div>
                     <div style="font-size: 14px; line-height: 1.5;">
@@ -1213,13 +1133,13 @@ def index():
                             <strong>Status:</strong> 
                             <span style="color: var(--success);">✅ Connected</span>
                         </div>
-                        <div style="font-size: 13px; color: var(--gray);">
+                        <div style="font-size: 13px; color: #666;">
                             Send /start to your bot to get commands
                         </div>
                     </div>
                 </div>
                 
-                <a href="/logout" class="logout-btn">
+                <a href="/logout" style="display: block; background: var(--danger); color: white; padding: 14px; border-radius: 8px; text-align: center; text-decoration: none; margin-top: 20px; font-weight: 600;">
                     <i class="fas fa-sign-out-alt"></i> Logout
                 </a>
             </div>
@@ -1231,16 +1151,17 @@ def index():
         </div>
         
         <script>
-            // Switch views
-            function switchView(view) {
-                window.location.href = '/?view=' + view;
-            }
-            
             // Set default times
             document.addEventListener('DOMContentLoaded', function() {
-                // Set start time to next hour
+                // Set start time to next hour in IST
                 const now = new Date();
-                const nextHour = new Date(now.getTime() + 60 * 60 * 1000);
+                const istOffset = 5.5 * 60 * 60 * 1000; // IST is UTC+5:30
+                const istTime = new Date(now.getTime() + istOffset);
+                
+                // Round to next hour
+                const nextHour = new Date(istTime);
+                nextHour.setHours(nextHour.getHours() + 1, 0, 0, 0);
+                
                 const startTime = document.getElementById('startTime');
                 const endTime = document.getElementById('endTime');
                 
@@ -1254,65 +1175,33 @@ def index():
                     endTime.value = start.toTimeString().slice(0,5);
                 }
                 
-                // Auto-update time display
+                // Update time display
                 function updateTime() {
-                    const now = new Date();
                     const timeElements = document.querySelectorAll('.time-display');
+                    const istTime = new Date(new Date().getTime() + (5.5 * 60 * 60 * 1000));
+                    const timeString = istTime.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
                     timeElements.forEach(el => {
-                        el.textContent = now.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+                        el.textContent = timeString + ' IST';
                     });
                 }
                 
                 updateTime();
                 setInterval(updateTime, 60000);
-                
-                // Handle form submissions
-                document.querySelectorAll('form').forEach(form => {
-                    if (form.action.includes('/delete_task')) {
-                        form.addEventListener('submit', function(e) {
-                            if (!confirm('Are you sure you want to delete this task?')) {
-                                e.preventDefault();
-                            }
-                        });
-                    }
-                });
             });
             
-            // Add swipe support for mobile
-            let startX = 0;
-            let endX = 0;
-            
-            document.addEventListener('touchstart', function(e) {
-                startX = e.changedTouches[0].screenX;
-            });
-            
-            document.addEventListener('touchend', function(e) {
-                endX = e.changedTouches[0].screenX;
-                const diff = startX - endX;
-                
-                if (Math.abs(diff) > 50) {
-                    const views = ['tasks', 'history', 'settings'];
-                    const currentView = '{{ view }}';
-                    const currentIndex = views.indexOf(currentView);
-                    
-                    if (diff > 0 && currentIndex < views.length - 1) {
-                        // Swipe left
-                        switchView(views[currentIndex + 1]);
-                    } else if (diff < 0 && currentIndex > 0) {
-                        // Swipe right
-                        switchView(views[currentIndex - 1]);
-                    }
-                }
-            });
+            function switchView(view) {
+                window.location.href = '/?view=' + view;
+            }
         </script>
     </body>
     </html>
     ''', 
-    tasks=tasks, 
+    tasks=processed_tasks, 
     history=history, 
     settings=settings, 
     view=view, 
     datetime=datetime,
+    now=now,
     USER_ID=USER_ID,
     completed_today=completed_today,
     pending_today=pending_today)
@@ -1349,17 +1238,20 @@ def add_task():
         return Response('Unauthorized', status=302, headers={'Location': '/'})
     
     title = request.form.get('title', '').strip()
-    start_time = request.form.get('start_time', '')
-    end_time = request.form.get('end_time', '')
+    start_time_str = request.form.get('start_time', '')
+    end_time_str = request.form.get('end_time', '')
     notify_enabled = 1 if request.form.get('notify_enabled') == 'on' else 0
     
-    if not title or not start_time or not end_time:
+    if not title or not start_time_str or not end_time_str:
         return Response('Missing required fields', status=302, headers={'Location': '/?view=tasks'})
     
-    # Create datetime strings
-    today = datetime.now().strftime('%Y-%m-%d')
-    start_datetime = f"{today} {start_time}:00"
-    end_datetime = f"{today} {end_time}:00"
+    # Create datetime in IST
+    today = get_ist_time().strftime('%Y-%m-%d')
+    start_dt = parse_ist_time(start_time_str, today)
+    end_dt = parse_ist_time(end_time_str, today)
+    
+    start_datetime = start_dt.strftime('%Y-%m-%d %H:%M:%S')
+    end_datetime = end_dt.strftime('%Y-%m-%d %H:%M:%S')
     
     # Insert task
     task_id = db_query(
@@ -1368,8 +1260,7 @@ def add_task():
     )
     
     # Send immediate notification if task starts soon
-    start_dt = datetime.strptime(start_datetime, '%Y-%m-%d %H:%M:%S')
-    now = datetime.now()
+    now = get_ist_time()
     minutes_until = int((start_dt - now).total_seconds() / 60)
     
     if 1 <= minutes_until <= 10:
@@ -1378,7 +1269,7 @@ def add_task():
         message += f"🕐 Starts in {minutes_until} minute"
         if minutes_until > 1:
             message += "s"
-        message += f"\n📅 {start_dt.strftime('%I:%M %p')}"
+        message += f"\n📅 {start_dt.strftime('%I:%M %p')} IST"
         send_telegram_message(message)
     
     return Response('', status=302, headers={'Location': '/?view=tasks'})
@@ -1395,19 +1286,17 @@ def complete_task():
         task = db_query("SELECT * FROM tasks WHERE id = ?", (task_id,), fetch_one=True)
         
         if task and not task['completed']:
-            # Update task
             db_query("UPDATE tasks SET completed = 1 WHERE id = ?", (task_id,))
             
-            # Add to history
             db_query(
                 "INSERT INTO history (task_id, title) VALUES (?, ?)",
                 (task_id, task['title'])
             )
             
-            # Send completion notification
+            now = get_ist_time()
             message = f"🎉 <b>Task Completed!</b>\n"
             message += f"✅ {task['title']}\n"
-            message += f"⏰ {datetime.now().strftime('%I:%M %p')}"
+            message += f"⏰ {now.strftime('%I:%M %p')} IST"
             send_telegram_message(message)
     
     return Response('', status=302, headers={'Location': '/?view=tasks'})
@@ -1453,33 +1342,17 @@ def change_code():
     
     return Response('', status=302, headers={'Location': '/?view=settings'})
 
-# ============= WEBHOOK ENDPOINT =============
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Telegram webhook endpoint"""
-    if request.headers.get('content-type') == 'application/json':
-        try:
-            json_string = request.get_data().decode('utf-8')
-            update = telebot.types.Update.de_json(json_string)
-            bot.process_new_updates([update])
-            return 'OK', 200
-        except Exception as e:
-            print(f"Webhook error: {e}")
-            return 'Error', 500
-    return 'Bad Request', 400
-
 # ============= START APPLICATION =============
 def start_bot_polling():
     """Start Telegram bot polling in background"""
     print("🤖 Starting Telegram bot polling...")
-    bot.remove_webhook()
-    time.sleep(1)
     bot.polling(none_stop=True, interval=1, timeout=30)
 
 if __name__ == '__main__':
     print("=" * 60)
     print("🚀 Task Tracker Starting...")
-    print(f"📅 Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    now = get_ist_time()
+    print(f"📅 IST Time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"🤖 Telegram User ID: {USER_ID}")
     print(f"🔔 Notifications: 1 per minute for 10 minutes before task start")
     print("=" * 60)

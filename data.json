@@ -26,9 +26,18 @@
       "time": "11:13 PM",
       "type": "task",
       "source": "telegram"
+    },
+    {
+      "id": 4,
+      "text": "Internal Server Error\nThe server encountered an internal error and was unable to complete your request. Either the server is overloaded or there is an error in the application.",
+      "timestamp": "2026-02-08 23:13:45",
+      "date": "February 08, 2026",
+      "time": "11:13 PM",
+      "type": "task",
+      "source": "telegram"
     }
   ],
   "messages": [],
   "notes": [],
-  "last_id": 3
+  "last_id": 4
 }

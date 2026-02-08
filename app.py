@@ -19,7 +19,7 @@ BOT_TOKEN = "8388773187:AAFxz5U8GJ94Wf21VaGvFx9QQSZFU2Rd43I"
 USER_ID = "8469993808"
 
 # GitHub Configuration
-GITHUB_TOKEN = "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"  # Replace with your GitHub token
+GITHUB_TOKEN = "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"  # Replace with your GitHub token
 GITHUB_REPO = "Qepheyr/gettingfast"  # Replace with your repo name
 GITHUB_FILE_PATH = "data.json"  # Path in repo
 

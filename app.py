@@ -29,7 +29,7 @@ MONGO_URI = os.getenv('MONGO_URI', "mongodb+srv://sandip:9E9AISFqTfU3VI5i@cluste
 IST = pytz.timezone('Asia/Kolkata')
 
 # Get Koyeb app URL from environment
-KOYEB_URL = os.getenv('KOYEB_APP_URL', 'localhost:8000')
+KOYEB_URL = os.getenv('KOYEB_APP_URL', 'https://excellent-carole-sandip232-8ee93947.koyeb.app')
 
 # ============= INITIALIZE =============
 app = Flask(__name__)
